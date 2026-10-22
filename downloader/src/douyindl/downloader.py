@@ -1,0 +1,2334 @@
+"""抖音视频/合集下载核心模块
+
+流程：
+1. 解析分享短链接 → 获取真实 URL（合集 / 单视频）
+2. 读取 config/config.yaml 配置
+3. 通过 f2 的 TokenManager 获取匿名 ttwid（无需登录）
+4. 调用 f2 的 DouyinCrawler + a_bogus 签名请求合集 / 视频接口
+5. 提取视频列表（序号、标题、下载地址）
+6. 用 httpx 流式下载无水印 mp4 文件
+   - 合集：创建子目录 YYYYMMDD_合集名，视频间间隔 mix_download_interval 秒
+   - 单视频：直接下载到输出目录
+7. 可选：保存元数据（封面/文案/原声/JSON）
+8. 可选：记录下载进度到 SQLite，支持断点续传与增量下载
+"""
+
+import asyncio
+import importlib.metadata
+import json
+import logging
+import os
+import random
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
+import yaml
+
+# ── f2 msToken 兜底补丁（必须在导入 crawler/model 之前打，否则 f2 导入期即崩溃） ──
+# f2 的 TokenManager.gen_real_msToken 依赖外部端点 mssdk.bytedance.com，该端点
+# 偶发 503/超时。f2 在 model.py 的 BaseRequestModel.msToken 类属性中于「导入期」
+# 直接调用它，而 f2 自带的 try/except 在 except 里又会二次调用同一个会失败的函数，
+# 导致整个模块导入失败、程序无法启动。
+# 这里提前打补丁：真实生成失败时回退到 f2 自带的 gen_false_msToken()（随机虚假
+# token），契合 f2 文档「出错时返回虚假值」的意图，且不改动 site-packages，
+# uv sync / uv lock 后仍生效。
+from f2.apps.douyin.utils import TokenManager as _F2TokenManager
+
+_original_gen_real_msToken = _F2TokenManager.gen_real_msToken.__func__
+
+
+def _safe_gen_real_msToken(cls):
+    try:
+        return _original_gen_real_msToken(cls)
+    except Exception:
+        # 端点故障（503/超时/网络错误等）时回退虚假 token，避免崩溃
+        return _F2TokenManager.gen_false_msToken()
+
+
+_F2TokenManager.gen_real_msToken = classmethod(_safe_gen_real_msToken)
+
+# f2 底层组件：crawler / model / filter / token（此时已使用打过补丁的 TokenManager）
+from f2.apps.douyin.crawler import DouyinCrawler
+from f2.apps.douyin.model import UserMix, PostDetail
+from f2.apps.douyin.filter import UserMixFilter, PostDetailFilter
+from f2.apps.douyin.utils import TokenManager
+# f2 的 API 异常（403/429/网络/超时等都会转成这些，便于在业务层精准重试）
+from f2.exceptions import (
+    APIResponseError,
+    APIRateLimitError,
+    APIUnauthorizedError,
+    APIConnectionError,
+    APITimeoutError,
+)
+
+# 统一日志出口（loguru）：控制台默认 INFO + 文件 app.log 固定 DEBUG
+from .logger import logger, setup_logger
+
+# 并发分段下载引擎（移植自即存 jicun-dl 的 NativeDownloader）
+from .download_engine import (
+    DEFAULT_FILE_CONCURRENCY,
+    DEFAULT_LANES,
+    DownloadError,
+    download_concurrent,
+)
+# 浏览器回退解析（抖音 Web 接口被 SecSDK 封死时的兜底方案）
+from .browser_fallback import (
+    BrowserNotFoundError,
+    BrowserResolveError,
+    resolve_via_browser,
+)
+
+# ── 配置加载 ────────────────────────────────────────────────────
+
+# 配置文件默认路径（项目根目录下 config/config.yaml）
+DEFAULT_CONFIG_PATH = Path(__file__).resolve().parent.parent.parent / "config" / "config.yaml"
+
+
+class Config:
+    """从 config.yaml 加载的配置对象。
+
+    属性与 config.yaml 中的字段一一对应，提供默认值兜底。
+    """
+
+    # HTTP 相关
+    user_agent: str
+    timeout: int
+    max_retries: int
+    max_tasks: int
+    max_connections: int
+
+    # API 相关
+    page_counts: int
+    api_request_interval: float
+
+    # 下载相关
+    mix_download_interval: int
+    chunk_size: int
+    filename_max_len: int
+    download_max_retries: int
+    download_retry_interval: float
+    max_download_speed: int
+
+    # 元数据保存
+    save_metadata: bool
+    save_cover: bool
+    save_desc: bool
+    save_music: bool
+    save_json: bool
+
+    # 进度持久化
+    enable_progress: bool
+    progress_db_path: str
+
+    # 输出目录
+    output_dir: str
+
+    def __init__(self, config_path: Optional[Path] = None):
+        path = config_path or DEFAULT_CONFIG_PATH
+        data = {}
+        if path.exists():
+            with open(path, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+
+        # 逐项加载，缺失时使用默认值
+        self.user_agent = data.get(
+            "user_agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
+        )
+        self.timeout = int(data.get("timeout", 15))
+        self.max_retries = int(data.get("max_retries", 5))
+        self.max_tasks = int(data.get("max_tasks", 5))
+        self.max_connections = int(data.get("max_connections", 5))
+
+        self.page_counts = int(data.get("page_counts", 20))
+        # API 层请求间隔（秒）：同时作为风控重试退避的 base。调大可降低首打 403 概率
+        self.api_request_interval = float(data.get("api_request_interval", 5.0))
+        # API 层重试次数（针对抖音间歇性风控 403/429/5xx 的兜底；f2 自身不重试这类错误）
+        self.api_max_retries = int(data.get("api_max_retries", 3))
+
+        self.mix_download_interval = int(data.get("mix_download_interval", 60))
+        self.chunk_size = int(data.get("chunk_size", 65536))
+        self.filename_max_len = int(data.get("filename_max_len", 60))
+        # 下载失败时的最大重试次数（不含首次下载），0 表示不重试
+        self.download_max_retries = int(data.get("download_max_retries", 3))
+        # 下载重试间隔（秒），失败后等待多久再重试
+        self.download_retry_interval = float(data.get("download_retry_interval", 5.0))
+        # 最大下载速度（字节/秒），0 表示不限速；如 10MB/s = 10485760
+        self.max_download_speed = int(data.get("max_download_speed", 0))
+
+        # 元数据保存：总开关默认关闭，子开关默认开启
+        self.save_metadata = bool(data.get("save_metadata", False))
+        self.save_cover = bool(data.get("save_cover", True))
+        self.save_desc = bool(data.get("save_desc", True))
+        self.save_music = bool(data.get("save_music", True))
+        self.save_json = bool(data.get("save_json", True))
+
+        # 进度持久化：默认启用
+        self.enable_progress = bool(data.get("enable_progress", True))
+        self.progress_db_path = data.get("progress_db_path", ".douyindl/progress.db")
+
+        self.output_dir = data.get("output_dir", "./downloads")
+
+        # 日志：控制台级别（默认 INFO）、日志文件路径（默认 app.log，文件固定 DEBUG）
+        self.log_level = data.get("log_level", "INFO")
+        self.log_file = data.get("log_file", "app.log")
+
+        # ── 认证 / 前置检查 ──
+        # 真实登录态 Cookie：填入可绕过抖音匿名风控 403（需含 sid_tt/sess 等登录字段）。
+        # 留空则使用匿名会话（真实 ttwid + 假 msToken），抖音可能间歇性/系统性 403。
+        self.login_cookie = data.get("login_cookie", "") or ""
+        # 依赖自检：启动时检查 f2 最新版，有更新则自动升级后重启（实现「下载前先更新依赖」）
+        self.preflight_check_deps = bool(data.get("preflight_check_deps", True))
+        # 连通性探针（金丝雀）：批量下载前探测接口是否可用，整体被拦截则提前中止
+        self.preflight_canary = bool(data.get("preflight_canary", True))
+
+        # ── 解析策略（v0.6.0）──
+        # 'auto'   : 先走 f2 接口，被系统性 403 拦截时自动降级到浏览器解析（推荐）
+        # 'f2'     : 只用 f2 接口（快，但服务端变更签名时会整体失败）
+        # 'browser': 只用浏览器解析（慢但稳，需本机 Chrome/Edge）
+        self.resolve_mode = str(data.get("resolve_mode", "auto")).lower()
+        # 浏览器解析单条等待播放器起播的最长秒数
+        self.browser_wait_seconds = float(data.get("browser_wait_seconds", 25.0))
+        # 浏览器 CDP 调试端口，0 表示自动选空闲端口
+        self.browser_port = int(data.get("browser_port", 0))
+
+        # ── 并发分段下载（v0.6.0，移植 jicun-dl）──
+        # 是否启用并发分段下载；关闭则退回单连接顺序流式下载
+        self.concurrent_download = bool(data.get("concurrent_download", True))
+        # 每文件并发连接数（对齐 jicun-dl DEFAULT_LANES）
+        self.dl_lanes = int(data.get("dl_lanes", DEFAULT_LANES))
+        # 同时下载几个文件（对齐 jicun-dl FILE_CONCURRENCY）
+        self.dl_file_concurrency = int(data.get(
+            "dl_file_concurrency", DEFAULT_FILE_CONCURRENCY))
+        # 主体分段大小（字节），默认 4MB
+        self.dl_segment_bytes = int(data.get("dl_segment_bytes", 4 * 1024 * 1024))
+        # 文件尾部切小段的范围与段大小（收尾阶段慢连接拖累按比例缩小）
+        self.dl_tail_bytes = int(data.get("dl_tail_bytes", 32 * 1024 * 1024))
+        self.dl_tail_chunk_bytes = int(data.get("dl_tail_chunk_bytes", 1024 * 1024))
+        # 小于此字节数不分段（单连接顺序下）
+        self.dl_segment_from_bytes = int(data.get(
+            "dl_segment_from_bytes", 8 * 1024 * 1024))
+        # 慢连接轮换阈值（秒）：一条连接在此时间内没收完当前段就掐掉换连接
+        self.dl_connection_budget = float(data.get("dl_connection_budget", 10.0))
+
+    @property
+    def default_headers(self) -> Dict[str, str]:
+        """构造默认请求头（含 UA 与 Referer）。"""
+        return {
+            "User-Agent": self.user_agent,
+            "Referer": "https://www.douyin.com/",
+        }
+
+
+# ── 合集 / 单视频 URL 特征 ─────────────────────────────────────
+
+_MIX_PATH_PATTERN = re.compile(r"/(?:share/mix/detail|collection)/(\d+)")
+_AWEME_ID_PATTERN = re.compile(r"/video/(\d+)")
+# 图文笔记页：https://www.douyin.com/note/<aweme_id>（PC Web 端 / 分享跳转后形态）
+_NOTE_ID_PATTERN = re.compile(r"/note/(\d+)")
+# PC Web 端详情页：https://www.douyin.com/jingxuan?modal_id=<aweme_id>
+_AWEME_ID_QS_PATTERN = re.compile(r"[?&]modal_id=(\d+)")
+# PC Web 端合集页：/collection?collection_id=<id> 或 ?mix_id=<id>
+_MIX_ID_QS_PATTERN = re.compile(r"[?&](?:collection_id|mix_id)=(\d+)")
+
+
+def _try_resolve(url: str) -> Optional[Tuple[str, str]]:
+    """从 URL 文本中解析 (资源类型, 资源ID)，未命中返回 None。
+
+    覆盖两类形态：
+      - 路径形态：/video/<id>、/note/<id>、/collection/<id>、/share/mix/detail/<id>
+      - PC Web 端查询参数形态：?modal_id=<aweme_id>、?collection_id=<id>、?mix_id=<id>
+    """
+    m = _MIX_PATH_PATTERN.search(url)
+    if m:
+        return "mix", m.group(1)
+    m = _AWEME_ID_PATTERN.search(url)
+    if m:
+        return "one", m.group(1)
+    m = _NOTE_ID_PATTERN.search(url)
+    if m:
+        return "one", m.group(1)
+    m = _MIX_ID_QS_PATTERN.search(url)
+    if m:
+        return "mix", m.group(1)
+    m = _AWEME_ID_QS_PATTERN.search(url)
+    if m:
+        return "one", m.group(1)
+    return None
+
+
+# ── 链接解析 ────────────────────────────────────────────────────
+
+async def resolve_share_url(share_url: str, config: Config) -> Tuple[str, str]:
+    """解析抖音分享短链接，返回 (资源类型, 资源ID)。
+
+    资源类型: 'mix'（合集）或 'one'（单视频）。
+
+    支持的输入：
+      - 短链 https://v.douyin.com/SlGTwuMq498/
+      - 合集页 https://www.iesdouyin.com/share/mix/detail/{id}/
+      - 合集页 https://www.douyin.com/collection/{id}
+      - 单视频 https://www.douyin.com/video/{id}
+      - 图文笔记 https://www.douyin.com/note/{id}
+      - PC Web 端详情页 https://www.douyin.com/jingxuan?modal_id={aweme_id}
+      - PC Web 端合集页 https://www.douyin.com/collection?collection_id={id}
+    """
+    url = share_url.strip()
+
+    # 先尝试从 URL 本身直接匹配（已是长链接 / PC Web 端 / 含查询参数的情况）
+    res = _try_resolve(url)
+    if res:
+        return res
+
+    # 短链需要跟随重定向
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers={"User-Agent": config.user_agent},
+        proxy=None,
+        timeout=config.timeout,
+    ) as client:
+        resp = await client.get(url)
+        final_url = str(resp.url)
+
+    # 重定向后的最终地址再尝试一次（短链可能跳转到 PC Web 端带 modal_id 的页面）
+    res = _try_resolve(final_url)
+    if res:
+        return res
+
+    raise ValueError(f"无法从链接解析资源类型: {share_url} → {final_url}")
+
+
+# ── Token 获取 ──────────────────────────────────────────────────
+
+# ── 会话预热（降低「裸 ttwid」首打 403 概率） ─────────────────────
+# 预热得到的首页 cookie（如 __ac_nonce）缓存一次，后续所有 API 请求复用；
+# 注意：sid_tt/odin_tt 等需浏览器 JS 才下发，纯 HTTP 拿不到，故预热仅补充
+# 首页下发的少量 cookie + 真实 ttwid，使请求比纯裸 ttwid 更像「连续会话」。
+_WARMED_COOKIES: Optional[str] = None
+
+
+def _warm_up_session(config: "Config") -> str:
+    """预热匿名会话：先 GET 抖音首页，取回首页下发的 cookie（如 __ac_nonce），
+    与后续真实 ttwid 合并，降低首打 403 概率。结果缓存，仅执行一次；
+    失败（网络/超时）则返回空串，退化到仅 ttwid。"""
+    global _WARMED_COOKIES
+    if _WARMED_COOKIES is not None:
+        return _WARMED_COOKIES
+    extra = ""
+    try:
+        headers = dict(config.default_headers)
+        with httpx.Client(
+            headers=headers,
+            proxies=None,
+            timeout=config.timeout,
+            follow_redirects=True,
+        ) as client:
+            resp = client.get("https://www.douyin.com/")
+        extra = "; ".join(f"{k}={v}" for k, v in resp.cookies.items())
+        if extra:
+            logger.debug(f"会话预热：获得首页 cookie {len(resp.cookies)} 项")
+    except Exception as e:
+        logger.warning(f"会话预热(首页)失败，跳过：{_short_err(e)}")
+    _WARMED_COOKIES = extra
+    return _WARMED_COOKIES
+
+
+def build_cookie(config: Optional["Config"] = None) -> str:
+    """生成 cookie。
+
+    - 若 config.login_cookie 非空：直接使用用户提供的真实登录态 Cookie，
+      绕过匿名风控（抖音对匿名 a_bogus 签名会系统性 403）。这是「一劳永逸」
+      绕过风控的核心手段；真实 Cookie 已含 ttwid/msToken/sid_tt 等全部字段。
+    - 否则：生成匿名 cookie——优先复用预热得到的首页 cookie（__ac_nonce 等），
+      再补一个真实 ttwid（每次新鲜，保留重试「换新会话」机制）与假 msToken。
+    config 为 None 时（极少路径）回退到裸 ttwid + 假 msToken。"""
+    if config is not None and getattr(config, "login_cookie", ""):
+        return config.login_cookie.strip()
+    ms_token = TokenManager.gen_false_msToken()
+    if config is None:
+        ttwid = TokenManager.gen_ttwid()
+        return f"ttwid={ttwid}; msToken={ms_token}"
+    warmed = _warm_up_session(config)
+    ttwid = TokenManager.gen_ttwid()
+    parts = []
+    if warmed:
+        parts.append(warmed)
+    parts.append(f"ttwid={ttwid}")
+    parts.append(f"msToken={ms_token}")
+    return "; ".join(parts)
+
+
+def build_crawler_kwargs(cookie: str, config: Config) -> Dict[str, Any]:
+    """构造 DouyinCrawler 所需的 kwargs。"""
+    return {
+        "headers": config.default_headers,
+        "cookie": cookie,
+        "proxies": {"http://": None, "https://": None},
+        "max_tasks": config.max_tasks,
+        "max_connections": config.max_connections,
+        "max_retries": config.max_retries,
+        "timeout": config.timeout,
+    }
+
+
+# ── API 请求重试（抖音间歇性风控 403 的兜底） ──────────────────────
+
+def _short_err(e: Exception, limit: int = 160) -> str:
+    """截断异常信息，避免把超长的抖音 API URL 整段打印到终端。"""
+    s = str(e)
+    return s if len(s) <= limit else s[:limit] + "..."
+
+
+# 失败链接记录文件：最终下载失败的链接以「当前时间 原因 url」追加写入，
+# 便于以后手工重试本文件（与 urls 同目录）
+FAILED_URLS_FILE = Path("urls_fail")
+
+
+def write_failed_url(url: str, reason: str) -> None:
+    """将最终失败的链接追加写入 urls_fail。格式：当前时间 原因 url。"""
+    try:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = f"{now} {reason} {url}\n"
+        with open(FAILED_URLS_FILE, "a", encoding="utf-8") as f:
+            f.write(line)
+        logger.debug(f"失败链接已记录到 {FAILED_URLS_FILE}: {line.strip()}")
+    except Exception as e:
+        logger.warning(f"写入失败链接记录 {FAILED_URLS_FILE} 失败: {e}")
+
+
+def _humanize_error(e: Exception) -> str:
+    """将底层异常转换为对用户友好的中文失败原因。
+
+    目标：避免让用户在日志里看到 'NoneType' object has no attribute 'get'
+    这类晦涩的 Python 内部错误。已知根因与对应文案：
+
+    - 视频被删除/设为私密/风控返回空数据 → aweme_detail 为 None，
+      已由 fetch_one_video 显式抛出可读错误（命中第一条规则，原样返回）。
+    - 其它未预期的 NoneType 错误 → 兜底提示，引导用户看 app.log。
+    - 网络/超时/403/429 等 → 给出重试建议。
+
+    返回翻译后的字符串；若无法归类则回退到原始错误信息。
+    """
+    msg = (str(e) or "").strip()
+    if not msg:
+        msg = type(e).__name__
+
+    # 已被业务代码显式抛出的、对人类可读的错误，原样返回
+    if any(k in msg for k in (
+        "视频可能已被作者删除",
+        "未获取到视频信息",
+        "无视频下载地址",
+        "无有效图片地址",
+        "无法从链接解析资源类型",
+    )):
+        return msg
+
+    # 之前会吞掉真因的晦涩写法：'NoneType' object has no attribute 'get'
+    if "NoneType" in msg and "get" in msg:
+        return ("接口返回内容为空（视频可能已被作者删除或设为私密，"
+                "或抖音风控导致数据缺失）；详见 app.log")
+
+    # 网络 / 超时类
+    if any(k in msg for k in ("ConnectError", "TimeoutError", "timed out",
+                              "连接", "Connection", "Timeout")):
+        return "网络请求失败（无法连接抖音服务器，请检查网络后重试）"
+
+    # HTTP 状态类
+    if "403" in msg:
+        return "请求被抖音拒绝（疑似风控），可稍后重试或更换网络"
+    if "429" in msg:
+        return "请求过于频繁（抖音限流），请降低速度后重试"
+
+    return msg
+
+
+async def _request_with_retry(
+    fetch_factory,
+    config: Config,
+    label: str = "API 请求",
+):
+    """对抖音 API 请求做带抖动退避的重试。
+
+    背景：f2 的 base_crawler 在收到 403/429/5xx 等 HTTP 状态错误时会**直接抛异常、
+    不进入重试循环**（它只在「响应内容为空」时才重试）。抖音对 aweme/detail 等接口
+    存在间歇性风控（偶发 403 Forbidden），表现为批量下载时零星失败——而换一条 PC
+    链接（新会话）重新跑往往就能成功。因此这里在业务层补一层重试。
+
+    - 每次重试都重新生成匿名 cookie（新 ttwid），相当于「换新会话」，规避被同一
+      会话风控标记。
+    - 退避间隔使用 _random_interval（[base*0.9, base] 随机），避免固定节奏被识别。
+    - 仅对瞬态错误（403/429/5xx/网络/超时）重试，逻辑错误（如取不到视频）不重试。
+
+    Args:
+        fetch_factory: 接收 kwargs(dict) 并返回协程的函数；每次重试都会以全新
+            kwargs（新 cookie）调用它，得到一个全新协程。
+        config: 配置对象（使用 api_max_retries / api_request_interval）
+        label: 日志前缀，便于区分是哪类请求在重试
+
+    Returns:
+        被调协程的返回值（视频字典 / 合集响应）
+    """
+    last_exc: Optional[Exception] = None
+    max_attempts = max(1, config.api_max_retries)
+    for attempt in range(max_attempts):
+        try:
+            cookie = build_cookie(config)
+            kwargs = build_crawler_kwargs(cookie, config)
+            return await fetch_factory(kwargs)
+        except (
+            APIResponseError,   # 403/5xx 等 HTTP 状态错误
+            APIRateLimitError,  # 429 频率限制
+            APIConnectionError,  # 网络异常
+            APITimeoutError,     # 超时
+        ) as e:
+            last_exc = e
+            if attempt < max_attempts - 1:
+                # 退避 base 取 api_request_interval 与 2s 的较大值，避免过短被识别
+                wait = _random_interval(max(config.api_request_interval, 2.0))
+                logger.warning(
+                    f"{label}遇风控/异常（第{attempt + 1}次），"
+                    f"{wait:.1f}秒后重试: {_short_err(e)}"
+                )
+                await asyncio.sleep(wait)
+            else:
+                logger.error(
+                    f"{label}重试 {max_attempts} 次仍失败: {_short_err(e)}"
+                )
+    assert last_exc is not None
+    raise last_exc
+
+
+def _make_mix_call(params):
+    """构造合集列表请求的协程工厂（供 _request_with_retry 使用）。"""
+    async def _call(kwargs):
+        async with DouyinCrawler(kwargs) as crawler:
+            return await crawler.fetch_user_mix(params)
+    return _call()
+
+
+def _make_post_detail_call(params):
+    """构造单视频详情请求的协程工厂（供 _request_with_retry 使用）。"""
+    async def _call(kwargs):
+        async with DouyinCrawler(kwargs) as crawler:
+            return await crawler.fetch_post_detail(params)
+    return _call()
+
+
+# ── 合集视频列表获取 ────────────────────────────────────────────
+
+def _extract_mix_name(response: Any) -> str:
+    """从合集 API 响应中提取合集名称。
+
+    合集 API 返回结构：response.aweme_list[0].mix_info.mix_name
+    """
+    try:
+        data = response.json() if hasattr(response, "json") else response
+        if isinstance(data, dict):
+            aweme_list = data.get("aweme_list") or []
+            if aweme_list:
+                mix_info = aweme_list[0].get("mix_info") or {}
+                return mix_info.get("mix_name") or ""
+    except Exception:
+        pass
+    return ""
+
+
+async def fetch_mix_videos(
+    mix_id: str,
+    config: Config,
+    max_counts: int = 0,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """获取合集内全部视频列表。
+
+    Args:
+        mix_id: 合集 ID
+        config: 配置对象
+        max_counts: 最大获取数量，0 表示不限
+
+    Returns:
+        (合集名, 视频信息字典列表)
+        每个字典除 filter 返回的字段外，额外补充 _meta 子字典（duration/width/height/
+        file_size/bit_rate/fps/ratio/video_format/is_h265 等视频元数据）
+    """
+    cookie = build_cookie()
+    kwargs = build_crawler_kwargs(cookie, config)
+
+    limit = max_counts if max_counts > 0 else float("inf")
+    cursor = 0
+    collected: List[Dict[str, Any]] = []
+    mix_name = ""
+
+    while len(collected) < limit:
+        current_size = min(config.page_counts, limit - len(collected))
+        params = UserMix(cursor=cursor, count=current_size, mix_id=mix_id)
+        # 合集列表接口同样会被抖音间歇性风控 403，走统一重试层兜底
+        response = await _request_with_retry(
+            _make_mix_call(params), config, label="获取合集列表"
+        )
+
+        # 从第一页响应中提取合集名
+        if not mix_name:
+            mix_name = _extract_mix_name(response)
+
+        mix = UserMixFilter(response)
+        page_items = mix._to_list()
+        if not page_items:
+            break
+
+        # 从原始响应提取每个视频的元数据，补充到 filter 返回的字典中
+        aweme_list = response.get("aweme_list", []) if isinstance(response, dict) else []
+        for item, aweme in zip(page_items, aweme_list):
+            item["_meta"] = _extract_video_meta(aweme)
+
+        collected.extend(page_items)
+        cursor = mix.max_cursor or 0
+
+        if not mix.has_more:
+            break
+
+        # 避免请求过于频繁
+        await asyncio.sleep(config.api_request_interval)
+
+    return mix_name, collected
+
+
+# ── 单视频信息获取 ──────────────────────────────────────────────
+
+async def fetch_one_video(aweme_id: str, config: Config) -> Dict[str, Any]:
+    """获取单个视频的详细信息（含无水印下载地址）。
+
+    注意：PostDetailFilter 只有 _to_dict() 方法（返回字典），
+    没有 _to_list()，与 UserMixFilter 不同。
+
+    返回的字典额外包含 _meta 子字典（duration/width/height/file_size/
+    bit_rate/fps/ratio/video_format/is_h265 等视频元数据）。
+    """
+    params = PostDetail(aweme_id=aweme_id)
+
+    def _factory(kwargs):
+        async def _call():
+            async with DouyinCrawler(kwargs) as crawler:
+                response = await crawler.fetch_post_detail(params)
+            video = PostDetailFilter(response)
+            # PostDetailFilter._to_dict() 返回单个视频字典
+            item = video._to_dict()
+            if not item:
+                raise ValueError(f"未获取到视频信息，aweme_id={aweme_id}")
+            # 从原始响应提取视频元数据
+            aweme_detail = (
+                response.get("aweme_detail") if isinstance(response, dict) else None
+            )
+            if not aweme_detail:
+                # 视频被作者删除 / 设为私密 / 风控返回空数据时，抖音接口会返回
+                # {"aweme_detail": null}（键存在但值为 None，默认 {} 不会被启用）。
+                # 若直接用 .get 会抛 'NoneType' object has no attribute 'get'。
+                # 这里提前给出明确、可阅读的失败原因；且此 ValueError 不在
+                # _request_with_retry 的重试清单内，属于确定性失败，不会白重试。
+                raise ValueError(
+                    "视频可能已被作者删除或设为私密，接口未返回内容（aweme_detail 为空）"
+                )
+            item["_meta"] = _extract_video_meta(aweme_detail)
+            # 图文笔记（aweme_type=68）处理：
+            # f2 的 PostDetailFilter 仅从 bit_rate[0].play_addr 取视频地址；
+            # 图文笔记的 bit_rate 为空，且其 video.play_addr 仅为音频（audio/mp4），
+            # 真实内容在 images 字段。故：有 bit_rate 走视频；否则若含图片，标记为
+            # 图文笔记并提取图片地址，同时清空 video_play_addr 避免误下音频。
+            raw_video = aweme_detail.get("video") or {}
+            if not raw_video.get("bit_rate"):
+                images = aweme_detail.get("images") or []
+                img_urls = [
+                    (im.get("url_list") or [None])[0]
+                    for im in images
+                    if isinstance(im, dict) and (im.get("url_list") or [None])[0]
+                ]
+                if img_urls:
+                    item["is_image_note"] = True
+                    item["images"] = img_urls
+                # 图文笔记无可用视频地址，置空避免误下音频
+                item["video_play_addr"] = None
+            return item
+        return _call()
+
+    # aweme/detail 接口会被抖音间歇性风控 403，走统一重试层兜底
+    # （每次重试都换新 ttwid，等价于「换 PC 链接重跑」能成功的情况）
+    return await _request_with_retry(_factory, config, label="获取视频详情")
+
+
+# ── 浏览器回退解析（v0.6.0）─────────────────────────────────────
+# 抖音 Web 接口 aweme/detail 现需 uifid + x-secsdk-web-signature（字节 BDMS
+# 原生 SDK 产物），纯 HTTP 无法复现 —— 详见 browser_fallback.py 模块文档。
+# 这里把浏览器解析结果转成与 f2 filter 等价的字典，让下游下载/入库逻辑
+# 完全无感（保持"解析层可替换"的设计）。
+
+def _from_browser_resolved(r) -> Dict[str, Any]:
+    """BrowserResolved → f2 filter 风格的视频字典。
+
+    字段对齐 `PostDetailFilter._to_dict()` 的子集，保证下游
+    `_build_video_name` / `download_metadata` / `ProgressDB.record` 无需改动。
+
+    v0.7.0：浏览器路径改为拦截 `aweme/detail` 响应体后，`r.raw_aweme` 里是
+    完整的 aweme_detail，因此封面/原声/时长等元数据**不再是缺失**，
+    可直接复用 `_extract_video_meta`（与 f2 路径同一套提取逻辑）。
+    """
+    name = _build_video_name(r.desc, r.aweme_id, 60)
+    # 完整 aweme_detail 走统一的元数据提取；兜底（旧 DOM 路径）只有昵称
+    if r.raw_aweme:
+        meta = _extract_video_meta(r.raw_aweme)
+    else:
+        meta = {"nickname": r.nickname or None}
+    return {
+        "aweme_id": r.aweme_id,
+        "desc": r.desc,
+        "video_play_addr": r.play_url,
+        # 原声可用性：接口返回了 play_url 才置 1（下游据此决定是否下载 mp3）
+        "music_status": 1 if r.music_play_url else 0,
+        "music_play_url": r.music_play_url or None,
+        "cover": r.cover_url or "",
+        "is_image_note": False,
+        "images": [],
+        "_meta": meta,
+        "_resolved_by": "browser",
+    }
+
+
+async def fetch_one_video_browser(
+    aweme_id: str, config: Config
+) -> Dict[str, Any]:
+    """用浏览器解析单个视频，返回 f2 filter 风格的字典。"""
+    results = await resolve_via_browser(
+        "one",
+        aweme_id,
+        user_agent=config.user_agent,
+        port=config.browser_port,
+        wait_seconds=config.browser_wait_seconds,
+    )
+    if not results:
+        raise BrowserResolveError(f"浏览器解析未返回结果（aweme_id={aweme_id}）")
+    return _from_browser_resolved(results[0])
+
+
+async def fetch_mix_videos_browser(
+    mix_id: str, config: Config, max_counts: int = 0
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """用浏览器解析合集，返回 (合集名, 视频字典列表)。"""
+    results = await resolve_via_browser(
+        "mix",
+        mix_id,
+        user_agent=config.user_agent,
+        port=config.browser_port,
+        wait_seconds=config.browser_wait_seconds * 2,   # 合集页需滚动，给双倍时间
+        max_items=max_counts,
+    )
+    mix_name = next((r.mix_name for r in results if r.mix_name), "")
+    videos = [_from_browser_resolved(r) for r in results if r.aweme_id]
+    return mix_name, videos
+
+
+def _is_systemic_block(exc: Exception) -> bool:
+    """判断异常是否为「服务端系统性拦截」（而非偶发风控）。
+
+    抖音服务端更新签名校验后，所有请求都会 403，此时重试再多次也无意义，
+    应立刻降级到浏览器解析。反之偶发 403 仍按原逻辑重试。
+
+    识别依据：f2 把 403 包装成 APIResponseError，其 str 里含状态码或
+    ArgusSecurityPlugin 的特征串。
+    """
+    msg = str(exc)
+    markers = (
+        "403",
+        "Forbidden",
+        "ArgusSecurityPlugin",
+        "Signature Not Found",
+        "Uifid Not Found",
+    )
+    return any(m in msg for m in markers)
+
+
+async def fetch_one_video_resilient(
+    aweme_id: str, config: Config
+) -> Dict[str, Any]:
+    """按 config.resolve_mode 解析单个视频，自动降级。
+
+    - 'f2'：只用 f2 接口
+    - 'browser'：只用浏览器
+    - 'auto'（默认）：先试 f2，遇系统性拦截立即降级浏览器并记住结果，
+      后续同批视频直接走浏览器（避免每条都白等一次重试）
+    """
+    if config.resolve_mode == "browser":
+        return await fetch_one_video_browser(aweme_id, config)
+
+    try:
+        return await fetch_one_video(aweme_id, config)
+    except Exception as e:
+        if config.resolve_mode == "auto" and _is_systemic_block(e):
+            logger.warning(
+                f"f2 接口被系统性拦截（{_short_err(e, 80)}），"
+                f"自动降级到浏览器解析"
+            )
+            # 记下本次进程已降级，后续不再重复试 f2
+            config.resolve_mode = "browser"
+            return await fetch_one_video_browser(aweme_id, config)
+        raise
+
+
+async def fetch_mix_videos_resilient(
+    mix_id: str, config: Config, max_counts: int = 0
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """按 config.resolve_mode 解析合集，自动降级（逻辑同上）。"""
+    if config.resolve_mode == "browser":
+        return await fetch_mix_videos_browser(mix_id, config, max_counts)
+
+    try:
+        return await fetch_mix_videos(mix_id, config=config, max_counts=max_counts)
+    except Exception as e:
+        if config.resolve_mode == "auto" and _is_systemic_block(e):
+            logger.warning(
+                f"f2 合集接口被系统性拦截（{_short_err(e, 80)}），"
+                f"自动降级到浏览器解析"
+            )
+            config.resolve_mode = "browser"
+            return await fetch_mix_videos_browser(mix_id, config, max_counts)
+        raise
+
+
+def _extract_video_meta(aweme: Dict[str, Any]) -> Dict[str, Any]:
+    """从 API 原始响应的单个 aweme 节点提取视频元数据。
+
+    f2 的 filter 会丢失 video 对象下的 width/height/data_size 等嵌套字段，
+    此函数从原始 JSON 中补充提取，用于写入进度数据库。
+
+    Args:
+        aweme: 原始响应中的 aweme_detail 或 aweme_list[i] 节点
+
+    Returns:
+        包含视频元数据的字典，字段缺失时为 None
+    """
+    if not aweme or not isinstance(aweme, dict):
+        return {}
+
+    video = aweme.get("video") or {}
+    # bit_rate 是列表，取第一个清晰度档位
+    bit_rate_list = video.get("bit_rate") or []
+    br0 = bit_rate_list[0] if bit_rate_list and len(bit_rate_list) > 0 else {}
+    play_addr = br0.get("play_addr") or {}
+
+    # 统计字段在 aweme 根节点下的 statistics
+    stats = aweme.get("statistics") or {}
+
+    # 作者昵称在 author 字段下
+    author = aweme.get("author") or {}
+
+    # create_time 是 UNIX 时间戳（秒），转字符串
+    create_ts = aweme.get("create_time")
+    create_time_str = ""
+    if create_ts and isinstance(create_ts, (int, float)):
+        try:
+            create_time_str = datetime.fromtimestamp(
+                int(create_ts), tz=datetime.now().astimezone().tzinfo
+            ).strftime("%Y-%m-%d %H:%M:%S")
+        except (ValueError, OSError):
+            create_time_str = ""
+
+    return {
+        "duration": video.get("duration"),          # 毫秒
+        "width": video.get("width"),                # 像素
+        "height": video.get("height"),              # 像素
+        "file_size": play_addr.get("data_size"),    # 字节
+        "bit_rate": br0.get("bit_rate"),            # bps
+        "fps": br0.get("FPS"),                      # 帧率
+        "ratio": video.get("ratio"),                # 分辨率标识，如 "2160p"
+        "video_format": video.get("format"),        # 格式，如 "mp4"
+        "is_h265": 1 if br0.get("is_h265") else 0,  # 0/1
+        "nickname": author.get("nickname"),         # 作者昵称
+        "digg_count": stats.get("digg_count"),      # 点赞数
+        "comment_count": stats.get("comment_count"),# 评论数
+        "share_count": stats.get("share_count"),    # 分享数
+        "collect_count": stats.get("collect_count"),# 收藏数
+        "create_time": create_time_str,             # 创建时间字符串
+    }
+
+
+# ── 视频下载 ────────────────────────────────────────────────────
+
+def _random_interval(base: float) -> float:
+    """在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别。
+
+    用于合集视频下载间隔、多链接间隔、失败重试间隔等场景，
+    将固定间隔改为随机区间，降低被抖音风控识别的概率。
+
+    Args:
+        base: 基础间隔秒数（如 config.mix_download_interval）
+
+    Returns:
+        随机间隔秒数，范围 [base*0.9, base]；base<=0 时返回 0
+    """
+    if base <= 0:
+        return 0
+    return random.uniform(base * 0.9, base)
+
+
+def _sanitize_filename(name: str, max_len: int = 60) -> str:
+    """清理文件名中的非法字符，去除 #话题 标签。"""
+    # 去除 #话题 标签（#后跟非空白字符）
+    name = re.sub(r"#[^\s#]+", "", name)
+    # 去除文件名非法字符
+    name = re.sub(r'[\\/:*?"<>|\n\r\t]', "", name).strip()
+    # 合并多余下划线/空格
+    name = re.sub(r"[_\s]+", "_", name).strip("_")
+    if len(name) > max_len:
+        name = name[:max_len].strip("_")
+    return name or "untitled"
+
+
+def _extract_topics(desc: str) -> List[str]:
+    """从文案中提取 #话题 标签文字（不含分隔符 _/#/空白）。
+
+    例: '#比亚迪_#原创作品' -> ['比亚迪', '原创作品']
+    """
+    return re.findall(r"#([^\s#_]+)", desc or "")
+
+
+def _build_video_name(desc: str, aweme_id: str, max_len: int = 60) -> str:
+    """生成视频文件名（不含日期前缀与扩展名）。
+
+    规则：
+    1. 优先使用去除 #话题 后的真实文案；
+    2. 若真实文案为空（整条文案都是话题标签），则拼接话题文字作为名称；
+    3. 仍为空则回退 'untitled'；
+    4. 末尾追加 _<aweme_id> 保证每个视频文件名唯一，
+       避免多个无标题/同名视频被「文件已存在」误判跳过。
+
+    例: '20260804_<base>_<aweme_id>.mp4'
+    """
+    # 1) 去除 #话题 标签，得到真实文案
+    text = re.sub(r"#[^\s#]+", "", desc or "")
+    text = re.sub(r'[\\/:*?"<>|\n\r\t]', "", text).strip()
+    text = re.sub(r"[_\s]+", "_", text).strip("_")
+    # 2) 无真实文案时，用话题文字拼接（如 '比亚迪_原创作品'）
+    if not text:
+        text = "_".join(_extract_topics(desc)).strip("_")
+    # 3) 兜底
+    if not text:
+        text = "untitled"
+    # 4) 拼接 aweme_id（为后缀预留长度预算）
+    suffix = f"_{aweme_id}"
+    budget = max_len - len(suffix)
+    if budget > 0 and len(text) > budget:
+        text = text[:budget].strip("_")
+    return f"{text}{suffix}"
+
+
+async def download_video(
+    video_url: str,
+    save_path: Path,
+    config: Config,
+    headers: Optional[Dict[str, str]] = None,
+) -> int:
+    """流式下载视频文件。
+
+    v0.6.0 起默认走**并发分段下载引擎**（`download_engine.download_concurrent`，
+    移植自即存 jicun-dl 的 NativeDownloader）：探针 → 分段 → 共享游标多路
+    并发 → seek 直接写偏移 → 断点续传 → 慢连接轮换 → 多道完整性校验。
+
+    实测收益（抖音 CDN 对单连接限速）：
+      - 单连接顺序下载：受单路限速制约，速度低
+      - 多路并发：聚合速度随连接数近似线性提升；断连只从断点续传，不整段重来
+
+    通过 config.concurrent_download=False 可退回旧的单连接顺序流式实现。
+
+    Args:
+        video_url: 无水印视频下载地址
+        save_path: 保存路径（含文件名）
+        config: 配置对象
+        headers: 额外请求头（并发模式下由引擎统一构造，此处仅用于单连接模式）
+
+    Returns:
+        下载的字节数
+    """
+    if not video_url:
+        raise ValueError("视频下载地址为空")
+
+    # 抖音视频地址可能缺 https: 前缀
+    if video_url.startswith("//"):
+        video_url = "https:" + video_url
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # ── 并发分段模式（默认）──
+    if getattr(config, "concurrent_download", True):
+        req_headers = config.default_headers | (headers or {})
+        max_speed = config.max_download_speed
+        speed_start = time.monotonic() if max_speed > 0 else 0.0
+
+        def _progress(downloaded: int, total: int) -> None:
+            _print_progress(downloaded, total)
+            # 限速：与单连接模式同一套算法——按累计字节算"期望用时"，
+            # 实际用时小于期望就 sleep 差值。这里不能用 await（回调是同步的），
+            # 故用 time.sleep；并封顶 1s 避免进度回调被长时间阻塞。
+            if max_speed > 0:
+                expected = downloaded / max_speed
+                actual = time.monotonic() - speed_start
+                if actual < expected:
+                    time.sleep(min(expected - actual, 1.0))
+
+        stats = await download_concurrent(
+            video_url,
+            save_path,
+            lanes=config.dl_lanes,
+            segment_bytes=config.dl_segment_bytes,
+            tail_bytes=config.dl_tail_bytes,
+            tail_chunk_bytes=config.dl_tail_chunk_bytes,
+            segment_from_bytes=config.dl_segment_from_bytes,
+            connection_budget=config.dl_connection_budget,
+            user_agent=config.user_agent,
+            referer=req_headers.get("Referer", "https://www.douyin.com/"),
+            progress_cb=_progress,
+            chunk_size=config.chunk_size,
+        )
+        if stats.size:
+            print()
+        logger.debug(
+            f"并发下载完成: {save_path.name} "
+            f"{stats.downloaded}/{stats.size}字节 "
+            f"chunks={stats.chunks} lanes={stats.lanes} "
+            f"重试={stats.retries} 轮换={stats.rotations} "
+            f"耗时={stats.elapsed:.2f}s"
+        )
+        return stats.downloaded
+
+    # ── 单连接顺序流式模式（concurrent_download=False 时的旧实现）──
+    req_headers = config.default_headers | (headers or {})
+
+    # 限速配置：max_download_speed 字节/秒，0 表示不限速
+    # 限速原理：每下载一个 chunk 后，按累计字节数计算"期望用时"，
+    # 若实际用时小于期望用时（下载太快），sleep 差值以降低速度
+    max_speed = config.max_download_speed
+    speed_limit_start = time.monotonic() if max_speed > 0 else 0
+
+    downloaded = 0
+    total = 0
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers=req_headers,
+        proxy=None,
+        timeout=60,
+    ) as client:
+        async with client.stream("GET", video_url) as resp:
+            resp.raise_for_status()
+            total = int(resp.headers.get("content-length", 0))
+            with open(save_path, "wb") as f:
+                async for chunk in resp.aiter_bytes(chunk_size=config.chunk_size):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    _print_progress(downloaded, total)
+
+                    # 限速：实际用时小于期望用时则 sleep 差值
+                    if max_speed > 0:
+                        expected_time = downloaded / max_speed
+                        actual_time = time.monotonic() - speed_limit_start
+                        if actual_time < expected_time:
+                            await asyncio.sleep(expected_time - actual_time)
+
+    # 进度条换行
+    if total:
+        print()
+    return downloaded
+
+
+def _print_progress(downloaded: int, total: int) -> None:
+    """在终端打印简单的下载进度条。"""
+    if total <= 0:
+        return
+    pct = min(downloaded * 100 // total, 100)
+    bar_len = 30
+    filled = bar_len * pct // 100
+    bar = "=" * filled + "-" * (bar_len - filled)
+    sys.stdout.write(f"\r  [{bar}] {pct:3d}% ")
+    sys.stdout.flush()
+
+
+def _image_ext(url: str) -> str:
+    """根据图片 URL 推断文件扩展名（忽略查询串）。"""
+    u = (url or "").split("?")[0].lower()
+    if ".webp" in u:
+        return ".webp"
+    if ".png" in u:
+        return ".png"
+    if ".jpg" in u or ".jpeg" in u:
+        return ".jpg"
+    return ".jpg"
+
+
+# ── 元数据下载 ──────────────────────────────────────────────────
+
+async def _download_simple(
+    url: str,
+    save_path: Path,
+    config: Config,
+) -> int:
+    """下载小文件（封面/音乐），无进度条，一次性写入。
+
+    与 download_video 的区别：不打印进度条，适用于体积较小的元数据文件。
+    """
+    if not url:
+        return 0
+    # 抖音 CDN 地址可能缺 https: 前缀
+    if url.startswith("//"):
+        url = "https:" + url
+
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+    async with httpx.AsyncClient(
+        follow_redirects=True,
+        headers=config.default_headers,
+        proxy=None,
+        timeout=60,
+    ) as client:
+        resp = await client.get(url)
+        resp.raise_for_status()
+        save_path.write_bytes(resp.content)
+    return len(resp.content)
+
+
+async def download_metadata(
+    video_data: Dict[str, Any],
+    base_path: Path,
+    config: Config,
+) -> None:
+    """保存视频元数据（封面/文案/原声/JSON）。
+
+    仅当 config.save_metadata=True 时执行，文件与视频同名但扩展名不同：
+      - 封面: base_path.jpg
+      - 文案: base_path.txt
+      - 原声: base_path.mp3
+      - 信息: base_path.json
+
+    Args:
+        video_data: 经 f2 filter 过滤后的视频信息字典
+        base_path: 不含扩展名的完整路径（如 .../001_文案）
+        config: 配置对象
+    """
+    if not config.save_metadata:
+        return
+
+    # 封面图
+    if config.save_cover:
+        cover_url = video_data.get("cover")
+        if cover_url:
+            try:
+                await _download_simple(cover_url, base_path.with_suffix(".jpg"), config)
+            except Exception as e:
+                logger.warning(f"封面下载失败: {e}")
+
+    # 文案全文
+    if config.save_desc:
+        desc = video_data.get("desc") or ""
+        if desc:
+            base_path.with_suffix(".txt").write_text(desc, encoding="utf-8")
+
+    # 原声 MP3
+    if config.save_music:
+        # music_status=1 表示原声可用
+        if video_data.get("music_status") == 1:
+            music_url = video_data.get("music_play_url")
+            if music_url:
+                try:
+                    await _download_simple(music_url, base_path.with_suffix(".mp3"), config)
+                except Exception as e:
+                    logger.warning(f"原声下载失败: {e}")
+
+    # 完整视频信息 JSON
+    if config.save_json:
+        json_path = base_path.with_suffix(".json")
+        description = video_data.get("desc") or ""
+        video_meta = video_data.get("_meta") or {}
+        json_data = dict(video_data)
+        json_data.update({
+            "original_title": video_data.get("title") or description,
+            "original_description": description,
+            "original_publish_date": video_meta.get("create_time") or None,
+            "wechat_channels_published": False,
+        })
+        # default=str 兜底处理不可序列化对象（如时间）
+        json_path.write_text(json.dumps(json_data, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+
+
+# ── 进度持久化 ──────────────────────────────────────────────────
+
+class ProgressDB:
+    """基于 SQLite 的下载进度数据库，支持断点续传与增量下载。
+
+    表结构：
+        downloaded_videos(
+            aweme_id        TEXT PRIMARY KEY,  -- 视频 ID
+            resource_type   TEXT NOT NULL,     -- 'mix' 或 'one'
+            resource_id     TEXT NOT NULL,     -- mix_id 或 aweme_id
+            mix_name        TEXT,              -- 合集名（单视频为 NULL）
+            desc            TEXT,              -- 视频文案
+            url             TEXT,              -- 视频原始分享 URL（用户输入的链接；单视频为其本身，合集为合集链接）
+            file_path       TEXT,              -- 保存路径
+            -- 视频元数据（从 API 原始响应提取，v0.4.0 新增）
+            duration        INTEGER,           -- 视频时长（毫秒）
+            width           INTEGER,           -- 视频宽度（像素）
+            height          INTEGER,           -- 视频高度（像素）
+            file_size       INTEGER,           -- 文件大小（字节，来自 API）
+            bit_rate        INTEGER,           -- 视频码率（bps）
+            fps             REAL,              -- 帧率
+            ratio           TEXT,              -- 分辨率标识（如 2160p）
+            video_format    TEXT,             -- 视频格式（如 mp4）
+            is_h265         INTEGER,           -- 是否 H.265 编码（0/1）
+            -- 作者与统计信息（v0.4.0 新增）
+            nickname        TEXT,              -- 作者昵称
+            digg_count      INTEGER,           -- 点赞数
+            comment_count   INTEGER,           -- 评论数
+            share_count     INTEGER,           -- 分享数
+            collect_count   INTEGER,           -- 收藏数
+            create_time     TEXT,              -- 视频创建时间
+            -- 下载状态（v0.5.0 新增，无论成功失败都记录）
+            status          TEXT DEFAULT 'success',  -- 下载状态：success / failed
+            error_msg       TEXT,                    -- 失败时的错误信息（成功时为 NULL）
+            retry_count     INTEGER DEFAULT 0,       -- 已重试次数（不含首次）
+            downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+
+    用法:
+        with ProgressDB(Path(".douyindl/progress.db")) as db:
+            if db.is_success_downloaded("123456"):
+                print("已下载成功")
+            db.record("123456", "mix", "mix_id_xxx", "合集名", "文案", "/path/to.mp4",
+                      status="success", meta={...})
+            for row in db.query_failed():
+                ...
+    """
+
+    def __init__(self, db_path: Path):
+        self.db_path = db_path
+        self._conn: Optional[sqlite3.Connection] = None
+
+    def __enter__(self) -> "ProgressDB":
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._conn = sqlite3.connect(str(self.db_path))
+        self._migrate_schema()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        if self._conn:
+            self._conn.close()
+            self._conn = None
+
+    def _migrate_schema(self) -> None:
+        """建表并对旧版数据库做列迁移（ALTER TABLE ADD COLUMN）。"""
+        if not self._conn:
+            return
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS downloaded_videos (
+                aweme_id        TEXT PRIMARY KEY,
+                resource_type   TEXT NOT NULL,
+                resource_id     TEXT NOT NULL,
+                mix_name        TEXT,
+                desc            TEXT,
+                file_path       TEXT,
+                downloaded_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # v0.4.0 新增字段：通过 PRAGMA 检测列是否存在，缺失则 ALTER TABLE 补齐
+        # 旧数据库（v0.3.0）只有 7 个字段，此处自动补齐新字段，保留历史记录
+        existing_cols = {
+            row[1]
+            for row in self._conn.execute("PRAGMA table_info(downloaded_videos)")
+        }
+        new_cols = {
+            "url": "TEXT",
+            "duration": "INTEGER",
+            "width": "INTEGER",
+            "height": "INTEGER",
+            "file_size": "INTEGER",
+            "bit_rate": "INTEGER",
+            "fps": "REAL",
+            "ratio": "TEXT",
+            "video_format": "TEXT",
+            "is_h265": "INTEGER",
+            "nickname": "TEXT",
+            "digg_count": "INTEGER",
+            "comment_count": "INTEGER",
+            "share_count": "INTEGER",
+            "collect_count": "INTEGER",
+            "create_time": "TEXT",
+            # v0.5.0 新增：下载状态字段，无论成功失败都记录
+            # 旧数据库中已有记录视为成功（status='success'），error_msg=NULL，retry_count=0
+            "status": "TEXT DEFAULT 'success'",
+            "error_msg": "TEXT",
+            "retry_count": "INTEGER DEFAULT 0",
+        }
+        for col, col_type in new_cols.items():
+            if col not in existing_cols:
+                self._conn.execute(
+                    f"ALTER TABLE downloaded_videos ADD COLUMN {col} {col_type}"
+                )
+        # 为 resource_id 建索引，加速合集场景下查询已下载视频
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_resource_id ON downloaded_videos(resource_id)"
+        )
+        # 为 status 建索引，加速 --retry-failed 查询失败记录
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_status ON downloaded_videos(status)"
+        )
+        self._conn.commit()
+
+    def is_success_downloaded(self, aweme_id: str) -> bool:
+        """查询某视频是否已记录为下载成功。
+
+        仅当 status='success' 时返回 True，失败记录不跳过会重新下载。
+        注意：不验证文件是否还在磁盘上，文件存在性由调用方额外判断。
+        """
+        if not self._conn:
+            return False
+        cur = self._conn.execute(
+            "SELECT 1 FROM downloaded_videos WHERE aweme_id = ? AND status = 'success'",
+            (aweme_id,),
+        )
+        return cur.fetchone() is not None
+
+    # 兼容旧调用方的别名（内部已改用 is_success_downloaded）
+    is_downloaded = is_success_downloaded
+
+    def record(
+        self,
+        aweme_id: str,
+        resource_type: str,
+        resource_id: str,
+        mix_name: str,
+        desc: str,
+        file_path: str,
+        url: Optional[str] = None,
+        meta: Optional[Dict[str, Any]] = None,
+        status: str = "success",
+        error_msg: Optional[str] = None,
+        retry_count: int = 0,
+    ) -> None:
+        """记录一条下载记录（已存在则更新），无论成功失败都记录。
+
+        Args:
+            url: 视频原始分享 URL（用户输入的链接）；单视频为其本身，合集为合集链接。
+                  重试场景下传 None，通过 COALESCE 保留已有值，不覆盖。
+            meta: 视频元数据字典，可包含 duration/width/height/file_size/
+                  bit_rate/fps/ratio/video_format/is_h265/nickname/
+                  digg_count/comment_count/share_count/collect_count/create_time
+                  缺失字段写 NULL
+            status: 下载状态，'success' 或 'failed'
+            error_msg: 失败时的错误信息（成功时传 None）
+            retry_count: 已重试次数（不含首次下载，0 表示首次即成功/失败）
+        """
+        if not self._conn:
+            return
+        meta = meta or {}
+        self._conn.execute(
+            """INSERT INTO downloaded_videos
+               (aweme_id, resource_type, resource_id, mix_name, desc, file_path, url,
+                duration, width, height, file_size, bit_rate, fps, ratio,
+                video_format, is_h265, nickname, digg_count, comment_count,
+                share_count, collect_count, create_time,
+                status, error_msg, retry_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(aweme_id) DO UPDATE SET
+                   resource_type=excluded.resource_type,
+                   resource_id=excluded.resource_id,
+                   mix_name=excluded.mix_name,
+                   desc=excluded.desc,
+                   file_path=excluded.file_path,
+                   url=COALESCE(excluded.url, url),
+                   duration=excluded.duration,
+                   width=excluded.width,
+                   height=excluded.height,
+                   file_size=excluded.file_size,
+                   bit_rate=excluded.bit_rate,
+                   fps=excluded.fps,
+                   ratio=excluded.ratio,
+                   video_format=excluded.video_format,
+                   is_h265=excluded.is_h265,
+                   nickname=excluded.nickname,
+                   digg_count=excluded.digg_count,
+                   comment_count=excluded.comment_count,
+                   share_count=excluded.share_count,
+                   collect_count=excluded.collect_count,
+                   create_time=excluded.create_time,
+                   status=excluded.status,
+                   error_msg=excluded.error_msg,
+                   retry_count=excluded.retry_count,
+                   downloaded_at=CURRENT_TIMESTAMP
+            """,
+            (
+                aweme_id, resource_type, resource_id, mix_name, desc, file_path, url,
+                meta.get("duration"),
+                meta.get("width"),
+                meta.get("height"),
+                meta.get("file_size"),
+                meta.get("bit_rate"),
+                meta.get("fps"),
+                meta.get("ratio"),
+                meta.get("video_format"),
+                meta.get("is_h265"),
+                meta.get("nickname"),
+                meta.get("digg_count"),
+                meta.get("comment_count"),
+                meta.get("share_count"),
+                meta.get("collect_count"),
+                meta.get("create_time"),
+                status,
+                error_msg,
+                retry_count,
+            ),
+        )
+        self._conn.commit()
+
+    def query_failed(self) -> List[Dict[str, Any]]:
+        """查询所有下载失败的记录（status='failed'），用于 --retry-failed 重试。
+
+        返回字典列表，每个字典包含 aweme_id/resource_type/resource_id/mix_name/
+        desc/file_path/error_msg/retry_count 等字段。
+        """
+        if not self._conn:
+            return []
+        cur = self._conn.execute(
+            """SELECT aweme_id, resource_type, resource_id, mix_name, desc,
+                      file_path, error_msg, retry_count
+               FROM downloaded_videos WHERE status = 'failed'
+               ORDER BY downloaded_at"""
+        )
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def count_by_resource(self, resource_id: str) -> int:
+        """统计某合集/单视频已下载成功的视频数（仅含 status='success'）。"""
+        if not self._conn:
+            return 0
+        cur = self._conn.execute(
+            "SELECT COUNT(*) FROM downloaded_videos WHERE resource_id = ? AND status = 'success'",
+            (resource_id,),
+        )
+        return cur.fetchone()[0]
+
+
+# ── 主流程 ──────────────────────────────────────────────────────
+
+class DouyinDownloader:
+    """抖音视频/合集下载器。
+
+    用法:
+        dl = DouyinDownloader()
+        asyncio.run(dl.run("https://v.douyin.com/SlGTwuMq498/"))
+    """
+
+    def __init__(
+        self,
+        output_dir: Optional[str] = None,
+        max_counts: int = 0,
+        config: Optional[Config] = None,
+        force: bool = False,
+    ):
+        self.config = config or Config()
+        # output_dir 优先用参数，其次用配置文件
+        self.output_dir = Path(output_dir) if output_dir else Path(self.config.output_dir)
+        self.max_counts = max_counts
+        # force=True 时忽略进度数据库记录，强制重新下载
+        self.force = force
+
+    def _get_progress_db(self) -> Optional[ProgressDB]:
+        """根据配置获取进度数据库实例（未启用时返回 None）。
+
+        数据库路径相对于当前工作目录解析（CLI 运行时 cwd 即项目根）。
+        """
+        if not self.config.enable_progress:
+            return None
+        db_path = Path(self.config.progress_db_path)
+        if not db_path.is_absolute():
+            db_path = Path.cwd() / db_path
+        return ProgressDB(db_path)
+
+    async def _download_with_retry(
+        self,
+        play_addr: str,
+        save_path: Path,
+    ) -> Tuple[bool, str, int]:
+        """带重试的下载，返回 (是否成功, 错误信息, 重试次数)。
+
+        重试次数由 config.download_max_retries 控制（0 表示不重试），
+        重试间隔由 config.download_retry_interval 控制。
+        retry_count 语义：0=首次即成功/失败，N=重试 N 次后成功/失败。
+        """
+        cfg = self.config
+        attempt = 0
+        last_error = ""
+        max_attempts = 1 + cfg.download_max_retries  # 首次 + 重试次数
+        for attempt in range(max_attempts):
+            try:
+                await download_video(play_addr, save_path, cfg)
+                return True, "", attempt
+            except Exception as e:
+                last_error = str(e)
+                if attempt < cfg.download_max_retries:
+                    logger.warning(
+                        f"下载失败（第{attempt+1}次尝试），"
+                        f"{cfg.download_retry_interval}秒后重试: {e}"
+                    )
+                    await asyncio.sleep(cfg.download_retry_interval)
+                else:
+                    logger.error(
+                        f"下载失败（共尝试{max_attempts}次，已用尽重试次数）: {e}"
+                    )
+        return False, last_error, attempt
+
+    async def _download_image_note(
+        self,
+        v: Dict[str, Any],
+        images: List[str],
+        aweme_id: str,
+        desc: str,
+        idx: str,
+        kind: str,
+        i: int,
+        date_str: str,
+        target_dir: Path,
+        progress_db: Optional["ProgressDB"],
+        share_url: str,
+    ) -> str:
+        """下载图文笔记的图片到子目录。
+
+        返回: 'ok'（下载成功）/ 'skipped'（已存在跳过）/ 'fail'（下载失败）。
+        """
+        cfg = self.config
+        name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
+        if kind == "mix":
+            save_dir = target_dir / f"{i:03d}_{name}"
+        else:
+            save_dir = target_dir / f"{date_str}_{name}"
+
+        # 跳过判断：目录非空 或 进度库已记录成功
+        if not self.force:
+            if save_dir.exists() and any(save_dir.iterdir()):
+                logger.info(f"{idx}{save_dir.name}/ 图片已存在，跳过")
+                return "skipped"
+            if progress_db and progress_db.is_success_downloaded(str(aweme_id)):
+                logger.info(f"{idx}{save_dir.name}/ 进度记录已存在，跳过")
+                return "skipped"
+
+        logger.info(f"{idx}下载图文笔记图片 → {save_dir.name}/ （{len(images)} 张）")
+        ok, last_error = await self._download_image_set(images, save_dir, cfg)
+
+        meta = v.get("_meta") or {}
+        first_img = save_dir / f"01{_image_ext(images[0]) if images else '.jpg'}"
+        rec_kwargs = dict(
+            aweme_id=str(aweme_id),
+            resource_type=kind,
+            resource_id=aweme_id,
+            mix_name="",
+            desc=desc[:200],
+            file_path=str(first_img),
+            url=share_url,
+            meta={**meta, "image_count": len(images)},
+            retry_count=0,
+        )
+        if ok:
+            # 元数据（封面/文案/JSON；图文笔记原声多半为空，music 下载会被跳过）
+            if cfg.save_metadata:
+                base_path = save_dir / name
+                await download_metadata(v, base_path, cfg)
+            if progress_db:
+                progress_db.record(**rec_kwargs, status="success", error_msg=None)
+            return "ok"
+
+        logger.error(f"{idx}{save_dir.name}/ 图片下载失败: {last_error[:200]}")
+        if progress_db:
+            progress_db.record(**rec_kwargs, status="failed", error_msg=last_error[:500])
+        return "fail"
+
+    async def _download_image_set(
+        self,
+        images: List[str],
+        save_dir: Path,
+        config: Config,
+    ) -> Tuple[bool, str]:
+        """下载一组图片到 save_dir，已存在的跳过。返回 (是否全部成功, 最后错误)。"""
+        save_dir.mkdir(parents=True, exist_ok=True)
+        total = len([u for u in images if u])
+        if total == 0:
+            return False, "无有效图片地址"
+        ok = 0
+        last_error = ""
+        for n, url in enumerate(images, 1):
+            if not url:
+                continue
+            save_path = save_dir / f"{n:02d}{_image_ext(url)}"
+            if save_path.exists():
+                ok += 1
+                continue
+            try:
+                await _download_simple(url, save_path, config)
+                ok += 1
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"图片 {n}/{total} 下载失败: {e}")
+        return (ok == total), ("" if ok == total else last_error)
+
+    async def retry_failed(self) -> Dict[str, Any]:
+        """重试数据库中所有下载失败的记录（status='failed'）。
+
+        流程：
+        1. 从 db 查询所有失败记录
+        2. 对每条记录用 aweme_id 调用 fetch_one_video 获取最新下载地址
+        3. 下载到原 file_path（带重试）
+        4. 更新 db 记录（成功则 status='success'，失败则刷新 error_msg/retry_count）
+
+        Returns:
+            统计字典，含 total/success/still_failed
+        """
+        cfg = self.config
+        logger.info("[retry-failed] 开始重试数据库中的失败记录...")
+
+        db = self._get_progress_db()
+        if db is None:
+            logger.error("进度数据库未启用，无法查询失败记录")
+            return {"total": 0, "success": 0, "still_failed": 0}
+
+        with db as progress_db:
+            failed_list = progress_db.query_failed()
+
+        if not failed_list:
+            logger.info("没有失败记录需要重试")
+            return {"total": 0, "success": 0, "still_failed": 0}
+
+        total = len(failed_list)
+        logger.info(f"共 {total} 条失败记录需要重试:")
+        for i, r in enumerate(failed_list, 1):
+            desc_short = (r.get("desc") or "").replace("\n", " ")[:40]
+            logger.debug(f"  {i:>3d}. [{r['aweme_id']}] {desc_short}")
+            if r.get("error_msg"):
+                logger.debug(f"       上次错误: {r['error_msg'][:80]}")
+
+        success = 0
+        still_failed = 0
+        with db as progress_db:
+            for i, r in enumerate(failed_list, 1):
+                aweme_id = r["aweme_id"]
+                save_path = Path(r["file_path"]) if r.get("file_path") else None
+                desc = r.get("desc") or ""
+                mix_name = r.get("mix_name") or ""
+                resource_id = r.get("resource_id") or aweme_id
+                resource_type = r.get("resource_type") or "one"
+
+                logger.debug(f"[{i}/{total}] 重试 {aweme_id}")
+
+                # 重新获取视频下载地址（旧地址可能已失效）
+                try:
+                    video = await fetch_one_video(str(aweme_id), cfg)
+                except Exception as e:
+                    logger.error(f"获取视频信息失败: {e}")
+                    # API 失败也记录到 db，更新 error_msg（meta 无法获取，置 None）
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path) if save_path else "",
+                        meta=None,
+                        status="failed",
+                        error_msg=f"获取视频信息失败: {str(e)[:400]}",
+                        retry_count=r.get("retry_count", 0) + cfg.download_max_retries,
+                    )
+                    still_failed += 1
+                    continue
+
+                play_addr = video.get("video_play_addr")
+                if isinstance(play_addr, list):
+                    play_addr = play_addr[0] if play_addr else None
+                if not play_addr:
+                    logger.info(f"无视频地址，跳过")
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path) if save_path else "",
+                        meta=video.get("_meta"),
+                        status="failed",
+                        error_msg="无视频下载地址",
+                        retry_count=r.get("retry_count", 0) + cfg.download_max_retries,
+                    )
+                    still_failed += 1
+                    continue
+
+                # 复用原 file_path，保持目录结构一致
+                if not save_path:
+                    name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
+                    date_str = datetime.now().strftime("%Y%m%d")
+                    save_path = self.output_dir / f"{date_str}_{name}.mp4"
+                save_path.parent.mkdir(parents=True, exist_ok=True)
+
+                download_ok, last_error, attempt = await self._download_with_retry(
+                    play_addr, save_path
+                )
+
+                if download_ok:
+                    success += 1
+                    # 下载元数据（封面/文案/原声/JSON）
+                    if cfg.save_metadata:
+                        base_path = save_path.with_suffix("")
+                        await download_metadata(video, base_path, cfg)
+                    # 更新 db 记录为成功
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path),
+                        meta=video.get("_meta"),
+                        status="success",
+                        error_msg=None,
+                        retry_count=attempt,
+                    )
+                else:
+                    still_failed += 1
+                    # 更新 db 记录为失败（累加重试次数）
+                    progress_db.record(
+                        aweme_id=str(aweme_id),
+                        resource_type=resource_type,
+                        resource_id=resource_id,
+                        mix_name=mix_name,
+                        desc=desc[:200],
+                        file_path=str(save_path),
+                        meta=video.get("_meta"),
+                        status="failed",
+                        error_msg=last_error[:500],
+                        retry_count=r.get("retry_count", 0) + attempt + 1,
+                    )
+
+                # 失败记录之间也等待间隔，避免风控（最后一个不等待）
+                # 间隔时间在 base*0.9 到 base 之间随机取数
+                if i < total and cfg.mix_download_interval > 0:
+                    actual_interval = _random_interval(cfg.mix_download_interval)
+                    logger.debug(f"等待 {actual_interval:.1f} 秒后继续...")
+                    await asyncio.sleep(actual_interval)
+
+        logger.info(f"[retry-failed] 完成: 成功 {success}/{total}，仍失败 {still_failed}")
+        return {
+            "total": total,
+            "success": success,
+            "still_failed": still_failed,
+        }
+
+    async def run(self, share_url: str) -> Dict[str, Any]:
+        """主入口：解析链接 → 获取视频列表 → 下载。
+
+        命名规则：
+        - 合集：创建子目录 YYYYMMDD_合集名，内部文件 001_文案.mp4
+        - 单视频：直接下载到 output_dir，文件名 YYYYMMDD_文案.mp4
+        - 合集内视频间间隔 mix_download_interval 秒，单视频无需等待
+
+        进度持久化（启用时）：
+        - 下载前查询 aweme_id 是否已记录，已记录且文件存在则跳过（断点续传）
+        - 下载成功后写入记录，支持下次增量下载
+
+        元数据保存（save_metadata=True 时）：
+        - 每个视频旁额外生成 .jpg/.txt/.mp3/.json
+
+        Returns:
+            统计字典，含 url/kind/resource_id/mix_name/total/success/skipped/target_dir
+        """
+        cfg = self.config
+        # 下载当日日期，用于目录名 / 单视频文件名前缀
+        date_str = datetime.now().strftime("%Y%m%d")
+
+        logger.debug(f"[1/4] 解析分享链接: {share_url}")
+        kind, resource_id = await resolve_share_url(share_url, cfg)
+
+        # mix_name 在两种场景下都需初始化，用于进度记录
+        mix_name = ""
+        if kind == "mix":
+            logger.info(f"检测到合集链接, mix_id={resource_id}")
+            mix_name, videos = await fetch_mix_videos_resilient(
+                resource_id,
+                config=cfg,
+                max_counts=self.max_counts,
+            )
+            if mix_name:
+                logger.info(f"合集名称: {mix_name}")
+
+            # 合集：创建子目录 YYYYMMDD_合集名
+            safe_name = _sanitize_filename(mix_name, cfg.filename_max_len) or resource_id
+            target_dir = self.output_dir / f"{date_str}_{safe_name}"
+            download_interval = cfg.mix_download_interval
+        else:
+            logger.info(f"检测到单视频链接, aweme_id={resource_id}")
+            videos = [await fetch_one_video_resilient(resource_id, cfg)]
+            # 单视频直接下载到 output_dir
+            target_dir = self.output_dir
+            download_interval = 0
+
+        logger.debug(f"[2/4] 共获取 {len(videos)} 个视频:")
+        for i, v in enumerate(videos, 1):
+            desc = (v.get("desc") or "").replace("\n", " ")[:40]
+            logger.debug(f"  {i:>3d}. [{v.get('aweme_id')}] {desc}")
+
+        # 打开进度数据库（上下文管理器确保连接关闭）
+        db = self._get_progress_db()
+        db_ctx = db if db is not None else _NullContext()
+
+        logger.debug(f"[3/4] 开始下载到 {target_dir}/ ...")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        success = 0
+        skipped = 0
+        with db_ctx as progress_db:
+            # 仅合集（多视频）才显示 [i/N] 序号；单视频无需序号，避免 [1/1] 误导
+            show_idx = len(videos) > 1
+            for i, v in enumerate(videos, 1):
+                # 视频之间空行分隔，提升可读性（首条不加）
+                if i > 1:
+                    logger.info("")
+
+                aweme_id = v.get("aweme_id", f"unknown_{i}")
+                desc = v.get("desc") or ""
+                play_addr = v.get("video_play_addr")
+                # video_play_addr 可能是列表（多个清晰度地址）
+                if isinstance(play_addr, list):
+                    play_addr = play_addr[0] if play_addr else None
+                images = v.get("images") or []
+
+                idx = f"[{i}/{len(videos)}] " if show_idx else ""
+
+                # 图文笔记：无视频地址但有图片，改下图片
+                if not play_addr and images:
+                    res = await self._download_image_note(
+                        v=v,
+                        images=images,
+                        aweme_id=aweme_id,
+                        desc=desc,
+                        idx=idx,
+                        kind=kind,
+                        i=i,
+                        date_str=date_str,
+                        target_dir=target_dir,
+                        progress_db=progress_db,
+                        share_url=share_url,
+                    )
+                    if res in ("ok", "skipped"):
+                        success += 1
+                    if res == "skipped":
+                        skipped += 1
+                    # 合集场景：图片笔记间也等待间隔（最后一个不等待）
+                    if download_interval and i < len(videos):
+                        actual_interval = _random_interval(download_interval)
+                        await asyncio.sleep(actual_interval)
+                    continue
+
+                if not play_addr:
+                    logger.info(f"{idx}{aweme_id} 无视频地址且无图片，跳过")
+                    continue
+
+                name = _build_video_name(desc, str(aweme_id), cfg.filename_max_len)
+                # 合集内文件：001_文案_awemeid.mp4（目录已含日期，无需重复）
+                # 单视频文件：YYYYMMDD_文案_awemeid.mp4
+                if kind == "mix":
+                    save_path = target_dir / f"{i:03d}_{name}.mp4"
+                else:
+                    save_path = target_dir / f"{date_str}_{name}.mp4"
+
+                # 跳过判断：文件已存在 或 进度数据库已记录为成功
+                # force=True 时跳过此检查，强制重新下载
+                # 注意：失败记录（status='failed'）不跳过，会重新下载
+                if not self.force:
+                    if save_path.exists():
+                        logger.info(f"{idx}{save_path.name} 文件已存在，跳过")
+                        success += 1
+                        skipped += 1
+                        continue
+                    if progress_db and progress_db.is_success_downloaded(str(aweme_id)):
+                        logger.info(f"{idx}{save_path.name} 进度记录已存在，跳过")
+                        skipped += 1
+                        continue
+
+                logger.info(f"{idx}下载 {save_path.name}")
+                # 下载重试：失败时自动重试 download_max_retries 次（0 表示不重试）
+                download_ok, last_error, attempt = await self._download_with_retry(
+                    play_addr, save_path
+                )
+
+                meta = v.get("_meta") or {}
+
+                if download_ok:
+                    success += 1
+                    # 打印视频元数据（从 API 响应提取）
+                    if meta:
+                        dur = meta.get("duration") or 0
+                        w = meta.get("width") or 0
+                        h = meta.get("height") or 0
+                        size = meta.get("file_size") or 0
+                        # 时长转秒，文件大小转 MB
+                        info_parts = []
+                        if dur:
+                            info_parts.append(f"时长 {dur/1000:.1f}s")
+                        if w and h:
+                            info_parts.append(f"分辨率 {w}x{h}")
+                        if size:
+                            info_parts.append(f"大小 {size/1024/1024:.1f}MB")
+                        if meta.get("ratio"):
+                            info_parts.append(meta["ratio"])
+                        if meta.get("is_h265"):
+                            info_parts.append("H.265")
+                        if info_parts:
+                            logger.info(f"元数据: {' · '.join(info_parts)}")
+
+                    # 下载元数据（封面/文案/原声/JSON）
+                    if cfg.save_metadata:
+                        # base_path 不含扩展名，用于生成 .jpg/.txt/.mp3/.json
+                        base_path = save_path.with_suffix("")
+                        await download_metadata(v, base_path, cfg)
+
+                    # 记录到进度数据库（成功，含视频元数据与重试次数）
+                    if progress_db:
+                        progress_db.record(
+                            aweme_id=str(aweme_id),
+                            resource_type=kind,
+                            resource_id=resource_id,
+                            mix_name=mix_name,
+                            desc=desc[:200],
+                            file_path=str(save_path),
+                            url=share_url,
+                            meta=meta,
+                            status="success",
+                            error_msg=None,
+                            retry_count=attempt,
+                        )
+                else:
+                    # 下载失败也记录到数据库，便于后续 --retry-failed 重试
+                    if progress_db:
+                        progress_db.record(
+                            aweme_id=str(aweme_id),
+                            resource_type=kind,
+                            resource_id=resource_id,
+                            mix_name=mix_name,
+                            desc=desc[:200],
+                            file_path=str(save_path),
+                            url=share_url,
+                            meta=meta,
+                            status="failed",
+                            error_msg=last_error[:500],
+                            retry_count=attempt,
+                        )
+
+                # 合集场景：视频间间隔等待（最后一个不需要）
+                # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
+                if download_interval and i < len(videos):
+                    actual_interval = _random_interval(download_interval)
+                    logger.debug(f"等待 {actual_interval:.1f} 秒后继续下载下一个...")
+                    await asyncio.sleep(actual_interval)
+
+        # 统计输出
+        # [4/4] 步骤标记仅在 DEBUG 显示（与 [1/4]~[3/4] 成组）；
+        # INFO 层只输出干净的完成汇总，避免默认控制台出现孤立的 [4/4]
+        logger.debug(f"[4/4] 完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
+        logger.info(f"完成: 成功 {success}/{len(videos)}，跳过 {skipped}")
+        # 保存目录属于细节信息，归入 DEBUG（默认控制台不显示，避免每条链接重复刷屏）
+        logger.debug(f"保存目录: {target_dir}/")
+        if progress_db and kind == "mix":
+            cum = progress_db.count_by_resource(resource_id)
+            logger.info(f"合集 {resource_id} 累计已下载 {cum} 个视频（含历史记录）")
+        return {
+            "url": share_url,
+            "kind": kind,
+            "resource_id": resource_id,
+            "mix_name": mix_name,
+            "total": len(videos),
+            "success": success,
+            "skipped": skipped,
+            "target_dir": str(target_dir),
+        }
+
+
+class _NullContext:
+    """空上下文管理器，用于进度数据库未启用时保持 with 语法统一。"""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        pass
+
+
+# ── 前置检查（每次下载前执行） ─────────────────────────────────
+# 把「抖音服务端变更导致匿名接口系统性 403」这类问题在批量下载前就暴露出来，
+# 而不是对每个链接反复重试 3 次、把整批误写进 urls_fail。两类检查：
+#   1. 依赖自检：确认 f2 是否为最新版（落地用户「每次下载前先更新依赖库」诉求）；
+#      若 PyPI 有更新则自动升级并重启，无网络时静默跳过。
+#   2. 连通性探针（金丝雀）：用若干已知公开视频探测接口是否可用；若全部 403
+#      （风控拦截），判定「下载方法当前整体失效」，提前中止并给出可操作建议。
+
+try:
+    _F2_VERSION = importlib.metadata.version("f2")
+except Exception:
+    _F2_VERSION = "0.0.1.7"
+
+# 金丝雀候选：覆盖若干公开视频 aweme_id。只要任意一个「接口可达」即判定方法健康；
+# 仅当全部返回 403/风控 才判定方法整体被服务端拦截。候选视频若已删除/私密，
+# 属「接口正常、仅该视频不可用」，同样视为健康。
+_CANARY_AWEME_IDS = (
+    "7680879925243711922",  # 用户曾报告的视频
+    "7308976139259642670",
+    "6943263674634496287",
+)
+
+
+def _check_deps_fresh(config: "Config") -> None:
+    """依赖自检：检查 f2 最新版，必要时自动升级后重启当前进程。
+
+    实现「每次下载前先更新依赖库」的诉求。f2 一旦发布适配抖音新签名的版本，
+    本工具会在下次运行时自动检测、升级并重启，加载新版后继续下载。
+    无网络 / PyPI 不可达时静默跳过，不阻碍主流程。
+    """
+    if not getattr(config, "preflight_check_deps", True):
+        return
+    import json
+    latest = None
+    try:
+        req = urllib.request.Request(
+            "https://pypi.org/pypi/f2/json",
+            headers={"User-Agent": "douyindl-preflight/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            latest = json.loads(resp.read().decode("utf-8")).get("info", {}).get("version")
+    except Exception as e:
+        logger.debug(f"依赖自检：无法连接 PyPI，跳过自动更新（{_short_err(e)}）")
+        return
+
+    if not latest or latest == _F2_VERSION:
+        logger.debug(f"依赖自检：f2 已是最新版（{_F2_VERSION}）")
+        return
+
+    logger.warning(f"依赖自检：检测到 f2 新版本 {_F2_VERSION} → {latest}，正在自动升级…")
+    project_root = Path(__file__).resolve().parent.parent.parent
+    uv_bin = shutil.which("uv") or "uv"
+    rc = subprocess.run(
+        [uv_bin, "pip", "install", f"f2=={latest}"],
+        cwd=str(project_root),
+    )
+    if rc.returncode == 0:
+        logger.info("依赖自检：f2 已升级，正在用新版本重新启动…")
+        # venv 已被 uv 更新；用同一解释器重跑本命令，加载新版 f2 后继续
+        os.execv(sys.executable, [sys.executable, "-m", "douyindl"] + sys.argv[1:])
+    else:
+        logger.error(
+            f"依赖自检：自动升级失败（uv 返回 {rc.returncode}），"
+            f"请手动运行 `uv pip install -U f2` 后重试"
+        )
+
+
+async def _probe_single(aweme_id: str, config: "Config") -> str:
+    """探测单个视频接口可用性，返回 OK / NOT_FOUND / BLOCKED / UNKNOWN。"""
+    try:
+        cookie = build_cookie(config)
+        kwargs = build_crawler_kwargs(cookie, config)
+        kwargs["max_retries"] = 1  # 探针只试一次，不浪费重试
+        async with DouyinCrawler(kwargs) as crawler:
+            resp = await crawler.fetch_post_detail(PostDetail(aweme_id=aweme_id))
+        if isinstance(resp, dict) and resp.get("aweme_detail"):
+            return "OK"
+        # 接口可达但视频已删除/私密 → 方法本身健康
+        return "NOT_FOUND"
+    except (APIResponseError, APIUnauthorizedError):
+        # 403 / 未授权 → 疑似风控拦截
+        return "BLOCKED"
+    except Exception as e:
+        logger.debug(f"金丝雀探测异常（{aweme_id}）：{_short_err(e)}")
+        return "UNKNOWN"
+
+
+async def _canary_probe(config: "Config") -> bool:
+    """连通性探针：若抖音服务端整体拦截匿名接口（全部 403），返回 False。
+
+    Returns:
+        True  → 可继续批量下载（方法健康或探针结论不确定，不应贸然中止）。
+        False → 下载方法当前整体失效，调用方应中止并给出建议。
+    """
+    outcomes: List[str] = []
+    for aid in _CANARY_AWEME_IDS:
+        st = await _probe_single(aid, config)
+        logger.debug(f"金丝雀探测 {aid}: {st}")
+        # 任一「接口可达」即判定方法健康，立即返回
+        if st in ("OK", "NOT_FOUND"):
+            return True
+        outcomes.append(st)
+    # 没有任何一个接口可达
+    if outcomes and all(s == "BLOCKED" for s in outcomes):
+        return False
+    # 存在 UNKNOWN（网络异常等）→ 不贸然中止
+    return True
+
+
+def _report_method_blocked() -> None:
+    """当金丝雀判定方法整体失效时，输出清晰、可操作的诊断信息。"""
+    logger.error(
+        f"抖音服务端已变更风控：当前 f2 {_F2_VERSION} 的匿名签名（a_bogus）"
+        f"被服务端拒绝（403），下载方法整体失效。"
+    )
+    logger.error(
+        "这不是代码 bug，也不是依赖过期（已确认 f2 为最新版、且会检测到新版自动升级）。"
+    )
+    logger.error(
+        "可选对策：① 等待 f2 发布适配新签名的新版（工具已自动检测，有更新会自升级并重启）；"
+        "② 在 config.yaml 填入真实登录态 Cookie（login_cookie）绕过匿名风控；"
+        "③ 改用浏览器解析（config.yaml 设 resolve_mode: browser），"
+        "由本机 Chrome 打开视频页取直链，不依赖 f2 签名；"
+        "④ 更换网络 IP / 稍后重试。"
+    )
+
+
+def main():
+    """CLI 入口：python -m douyindl <分享链接> [输出目录]
+
+    链接来源（二选一或组合）：
+    - url 位置参数：直接传入分享文本（支持空格分隔多个链接）
+    - -i/--input-file：从文件读取分享文本（支持多行/空格分隔），下载后保留文件内容不清空
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="抖音视频/合集下载工具（支持短链分享文本）"
+    )
+    parser.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="抖音分享链接（短链或完整URL，可包含分享文本）；支持空格分隔多个链接。"
+             "若未指定，需通过 -i/--input-file 提供链接文件",
+    )
+    parser.add_argument(
+        "-i", "--input-file",
+        default=None,
+        help="从文件读取分享链接（每行一个或空格分隔多个），下载完成后保留文件内容，"
+             "不清空；已下载视频会被进度库/文件存在检查自动跳过，可反复复用该文件",
+    )
+    parser.add_argument(
+        "-o", "--output",
+        default=None,
+        help="视频保存目录（默认使用 config.yaml 中的 output_dir）",
+    )
+    parser.add_argument(
+        "-n", "--max-counts",
+        type=int, default=0,
+        help="最大下载视频数，0 表示不限",
+    )
+    parser.add_argument(
+        "-c", "--config",
+        default=None,
+        help="配置文件路径（默认 config/config.yaml）",
+    )
+    parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="强制重新下载，忽略进度数据库记录",
+    )
+    parser.add_argument(
+        "-r", "--retry-failed",
+        action="store_true",
+        help="重试数据库中所有下载失败的记录（status='failed'），无需提供 url/-i",
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="详细模式：控制台日志级别降为 DEBUG，显示 [1/4]~[4/4] 等步骤细节（默认 INFO）",
+    )
+    parser.add_argument(
+        "-m", "--metadata",
+        nargs="?", const="all", default=None,
+        help="保存元数据，可选类型: all/cover/desc/music/json（逗号分隔多个）；"
+             "仅 -m 等同于 all；未指定时使用 config.yaml 中的 save_metadata 设置",
+    )
+    args = parser.parse_args()
+
+    # 加载配置
+    config_path = Path(args.config) if args.config else None
+    config = Config(config_path)
+
+    # 配置日志：控制台级别由 config.log_level 控制（默认 INFO），文件 app.log 固定 DEBUG
+    # -v/--verbose 可让控制台也显示 DEBUG 步骤细节（否则步骤日志仅写入 app.log）
+    setup_logger(
+        level="DEBUG" if args.verbose else config.log_level,
+        log_file=config.log_file,
+    )
+
+    # ── 前置检查 1：依赖自检（可能自动升级 f2 并重启当前进程） ──
+    _check_deps_fresh(config)
+
+    # ── 前置检查 2：连通性探针（金丝雀）──
+    # 若抖音服务端整体拦截匿名接口（全部 403），提前中止并给出可操作建议，
+    # 避免对每个链接反复重试 3 次、把整批误写进 urls_fail。
+    #
+    # 但 resolve_mode=browser 时不走 f2 接口（浏览器路径不依赖签名），
+    # 此时金丝雀失败属预期，不应阻断流程。
+    if config.preflight_canary and config.resolve_mode != "browser":
+        try:
+            healthy = asyncio.run(_canary_probe(config))
+        except Exception as e:
+            logger.warning(f"前置探针异常，跳过（{_short_err(e)}）")
+            healthy = True
+        if not healthy:
+            if config.resolve_mode == "auto":
+                # auto 模式：f2 不可用但浏览器路径可用，降级继续而非中止
+                logger.warning(
+                    "f2 接口探针未通过（疑似系统性 403），将自动降级到浏览器解析。"
+                    "如需强制使用 f2，请在 config.yaml 设 resolve_mode: f2。"
+                )
+                logger.info("")
+                config.resolve_mode = "browser"
+            else:
+                _report_method_blocked()
+                sys.exit(2)
+
+    # 会话预热：先访问抖音首页拿到首页 cookie，降低后续 API 首打 403 概率
+    # （仅执行一次，结果缓存；失败不影响主流程，回退裸 ttwid）
+    _warm_up_session(config)
+
+    # CLI -m 参数精细控制元数据子开关
+    # - 未指定 -m：沿用 config.yaml 设置
+    # - -m 或 -m all：开启全部元数据
+    # - -m music,cover：仅开启指定类型，其余关闭
+    if args.metadata is not None:
+        meta_types = args.metadata.lower()
+        meta_all = meta_types == "all"
+        # 解析逗号分隔的类型列表
+        wanted = set(t.strip() for t in meta_types.split(",") if t.strip())
+        valid = {"cover", "desc", "music", "json", "all"}
+        invalid = wanted - valid
+        if invalid:
+            logger.error(f"未知的元数据类型 {invalid}，可选: {valid}")
+            sys.exit(1)
+        config.save_metadata = True
+        config.save_cover = meta_all or "cover" in wanted
+        config.save_desc = meta_all or "desc" in wanted
+        config.save_music = meta_all or "music" in wanted
+        config.save_json = meta_all or "json" in wanted
+
+    dl = DouyinDownloader(
+        output_dir=args.output,
+        max_counts=args.max_counts,
+        config=config,
+        force=args.force,
+    )
+
+    # ── --retry-failed 模式：重试 db 中的失败记录，不需要 url/-i ──
+    if args.retry_failed:
+        asyncio.run(dl.retry_failed())
+        return
+
+    # ── 收集所有 URL 来源（url 参数 + 输入文件） ──
+    raw_texts: List[str] = []
+    if args.url:
+        raw_texts.append(args.url)
+    input_path: Optional[Path] = None
+    if args.input_file:
+        input_path = Path(args.input_file)
+        if not input_path.exists():
+            logger.error(f"输入文件不存在: {input_path}")
+            sys.exit(1)
+        file_content = input_path.read_text(encoding="utf-8")
+        if not file_content.strip():
+            logger.error(f"输入文件内容为空: {input_path}")
+            sys.exit(1)
+        raw_texts.append(file_content)
+
+    if not raw_texts:
+        logger.error("未提供分享链接，请通过 url 参数或 -i/--input-file 指定，"
+                     "或使用 -r/--retry-failed 重试失败记录")
+        sys.exit(1)
+
+    # 从所有文本来源中提取 URL（支持空格/换行分隔多链接）
+    # 用户可能用反引号包裹 URL（如 markdown 示例），strip 掉反引号
+    urls: List[str] = []
+    for text in raw_texts:
+        found = re.findall(r'https?://[^\s，,]+', text)
+        urls.extend(u.strip("`") for u in found if u.strip("`"))
+    # 去重并保持源文件 URL 顺序（严禁排序）：同一链接只下载一次，
+    # dict.fromkeys 利用字典保序特性实现有序去重，等价于按文件出现顺序去重
+    urls = list(dict.fromkeys(urls))
+
+    if not urls:
+        logger.error("未在输入中找到有效的 URL")
+        sys.exit(1)
+
+    # 多链接串行下载（asyncio.run 只能调用一次，包一层协程循环）
+    async def run_all() -> None:
+        total = len(urls)
+        results: List[Dict[str, Any]] = []
+        for i, url in enumerate(urls, 1):
+            if total > 1:
+                # 链接之间空行分隔，提升可读性（首条不加）
+                if i > 1:
+                    logger.info("")
+                logger.debug(f"========== [{i}/{total}] {url} ==========")
+            try:
+                stat = await dl.run(url)
+                results.append(stat)
+            except Exception as e:
+                # 单个链接失败不中断后续链接
+                reason = _humanize_error(e)
+                logger.error(f"下载失败: {reason}")
+                # 记录到 urls_fail（时间 原因 url），便于以后手工重试本文件
+                write_failed_url(url, reason)
+                results.append({
+                    "url": url, "kind": "", "resource_id": "", "mix_name": "",
+                    "total": 0, "success": 0, "skipped": 0, "target_dir": "",
+                    "error": reason,
+                })
+            # 多链接之间等待间隔，防止风控（复用 mix_download_interval，最后一个不等待）
+            # 间隔时间在 base*0.9 到 base 之间随机取数，避免固定间隔被风控识别
+            if i < total and config.mix_download_interval > 0:
+                actual_interval = _random_interval(config.mix_download_interval)
+                logger.debug(f"等待 {actual_interval:.1f} 秒后继续下载下一个链接...")
+                await asyncio.sleep(actual_interval)
+
+        # 多链接下载总结
+        if total > 1:
+            logger.info("")
+            sum_success = sum(r.get("success", 0) for r in results)
+            sum_skipped = sum(r.get("skipped", 0) for r in results)
+            sum_total = sum(r.get("total", 0) for r in results)
+            failed_links = [r["url"] for r in results if r.get("error")]
+            logger.info("========== 多链接下载总结 ==========")
+            for i, r in enumerate(results, 1):
+                kind_label = "合集" if r.get("kind") == "mix" else (
+                    "单视频" if r.get("kind") == "one" else "失败"
+                )
+                if r.get("error"):
+                    # 失败：展示原始短链 + 失败原因
+                    name = r.get("url") or r.get("resource_id") or ""
+                    status = f"失败: {r['error']}"
+                else:
+                    name = r.get("mix_name") or r.get("resource_id") or ""
+                    status = f"成功 {r.get('success', 0)}/{r.get('total', 0)}，跳过 {r.get('skipped', 0)}"
+                logger.info(f"  [{i}/{total}] {kind_label} {name} - {status}")
+            if failed_links:
+                logger.info(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}，失败 {len(failed_links)} 个链接")
+            else:
+                logger.info(f"  合计: 成功 {sum_success}/{sum_total}，跳过 {sum_skipped}")
+
+    asyncio.run(run_all())
+
+    # 下载完成后清空输入文件内容（保留文件本身），便于反复粘贴新链接复用
+    # if input_path and input_path.exists():
+        # input_path.write_text("", encoding="utf-8")
+        # print(f"\n已清空输入文件: {input_path}")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,36 @@
+# macOS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+
+# Service environments and generated runtime data
+downloader/.venv/
+downloader/var/
+downloader/logs/
+publisher/.venv/
+publisher/var/
+webui/.venv/
+webui/__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.log
+.workbuddy/
+downloader/urls
+
+# Local secrets
+.env
+.env.*
+!.env.example
+
+# Downloaded videos and metadata are local user data
+Videos/*
+!Videos/.gitkeep

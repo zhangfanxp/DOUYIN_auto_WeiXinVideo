@@ -1,0 +1,12 @@
+[project]
+name = "douyin-channels-webui"
+version = "0.1.0"
+description = "Gradio UI for downloading Douyin videos and publishing to WeChat Channels"
+requires-python = ">=3.12"
+dependencies = [
+    "gradio>=6.0,<7.0",
+    "httpx>=0.27,<1.0",
+]
+
+[tool.uv]
+package = false

@@ -1,0 +1,167 @@
+# 抖音视频/合集下载工具配置文件
+# 路径: config/config.yaml
+# 说明: 所有运行参数集中在此文件管理，修改后无需改动代码
+
+# ── HTTP 请求相关 ──────────────────────────────────────────────
+
+# User-Agent：必须与 f2/conf/conf.yaml 中的 UA 保持一致，否则 a_bogus 签名校验失败
+user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0"
+
+# HTTP 请求超时（秒）
+timeout: 20
+
+# API 请求最大重试次数
+max_retries: 5
+
+# 最大并发任务数（f2 crawler 内部信号量）
+max_tasks: 1
+
+# 最大连接数（httpx 连接池）
+max_connections: 5
+
+
+# ── 抖音 API 调用相关 ─────────────────────────────────────────
+
+# 合集 API 分页每页条数（不建议超过 20，可能触发风控）
+page_counts: 10
+
+# API 分页请求间隔（秒），避免抖音风控；同时作为「风控重试」退避的 base（实际退避≈此值±10%）
+# 调大可降低「裸会话首打 403」概率（配合会话预热使用），代价是请求更稀疏、整体更慢
+api_request_interval: 5.0
+
+# API 层重试次数：针对抖音对 aweme/detail / 合集列表的间歇性风控（偶发 403/429/5xx）
+# 注意：f2 自身遇到这类 HTTP 状态错误会直接抛异常、不重试，因此这里在业务层补一层
+# 重试；每次重试都会重新生成匿名 ttwid（换新会话），等价于「换 PC 链接重跑」能成功的情况
+api_max_retries: 3
+
+
+# ── 视频下载相关 ──────────────────────────────────────────────
+
+# 合集内视频下载间隔（秒），合集场景使用，单视频无需等待
+# 用户要求合集间隔 60 秒
+mix_download_interval: 60
+
+# 流式下载 chunk 大小（字节），默认 64KB
+chunk_size: 65536
+
+# 下载文件名最大长度（字符）
+filename_max_len: 60
+
+# 下载失败时的最大重试次数（不含首次下载），0 表示不重试
+download_max_retries: 2
+
+# 下载重试间隔（秒），失败后等待多久再重试
+download_retry_interval: 3.0
+
+# 最大下载速度（字节/秒），0 表示不限速
+# 示例：10MB/s = 10485760，5MB/s = 5242880，1MB/s = 1048576
+max_download_speed: 1048576
+
+
+# ── 元数据保存 ────────────────────────────────────────────────
+
+# 总开关：是否额外保存视频元数据（封面/文案/原声/JSON）
+# 开启后，每个视频旁边会生成同名 .jpg/.txt/.mp3/.json 文件
+save_metadata: false
+
+# 子开关（仅当 save_metadata=true 时生效）
+save_cover: true       # 视频封面图 (.jpg)
+save_desc: true        # 视频文案全文 (.txt)
+save_music: true       # 原声 MP3 (.mp3)
+save_json: true        # 完整视频信息 JSON (.json)
+
+
+# ── 进度持久化 ────────────────────────────────────────────────
+
+# 是否启用进度数据库（SQLite），用于断点续传和增量下载
+# 启用后，已成功下载的视频会记录到 .douyindl/progress.db
+# 再次下载同一合集时，已下载的视频会自动跳过
+enable_progress: true
+
+# 进度数据库路径（默认项目根目录 .douyindl/progress.db）
+progress_db_path: ".douyindl/progress.db"
+
+
+# ── 输出目录相关 ──────────────────────────────────────────────
+
+# 默认输出根目录（CLI -o 参数可覆盖）
+output_dir: "./downloads"
+
+
+# ── 日志相关 ──────────────────────────────────────────────────
+
+# 控制台日志级别（默认 INFO）：DEBUG / INFO / WARNING / ERROR
+# 设为 DEBUG 可在控制台看到 [1/4]~[4/4] 等步骤细节；也可运行时加 -v/--verbose
+# 注：文件 app.log 始终记录 DEBUG 及以上全部细节，便于事后排查
+log_level: "INFO"
+
+# 日志文件路径（默认项目根目录 app.log）；文件级别固定 DEBUG，含完整时间/位置
+log_file: "app.log"
+
+
+# ── 认证与会话 ────────────────────────────────────────────────
+# 真实登录态 Cookie（可选）：绕过抖音匿名风控 403 的核心手段。
+# 获取：抖音网页端(douyin.com)登录后，F12 → Network → 任意请求 → Request Headers
+#       的 Cookie 整串复制填入。需含 sid_tt / sess / uid_tt / odin_tt 等登录字段。
+# 留空 "" → 使用匿名会话（真实 ttwid + 假 msToken），抖音可能间歇性/系统性 403。
+# 注意：登录 Cookie 有有效期，过期后需重新复制；失效时接口仍会 403。
+login_cookie: ""
+
+# ── 前置检查（每次下载前执行） ───────────────────────────────
+# 依赖自检：启动时检查 f2 是否为最新版，若 PyPI 有更新则自动升级后重启当前进程
+# （正是「每次下载前先更新依赖库」的落地）。网络不可达时静默跳过，不影响主流程。
+preflight_check_deps: true
+
+# 连通性探针（金丝雀）：正式批量下载前，用若干已知公开视频探测接口是否可用。
+# 若抖音服务端风控拦截（403）导致方法整体失效，提前告警；resolve_mode=auto 时
+# 自动降级到浏览器解析并继续，设为 false 可强制跳过（不推荐）。
+preflight_canary: true
+
+
+# ── 解析策略（v0.6.0）─────────────────────────────────────────
+# 抖音 Web 接口 aweme/detail 现要求 uifid 参数 + x-secsdk-web-signature 签名
+# （字节 BDMS 安全 SDK 的原生算法产物，纯 HTTP 无法复现），表现为：
+#   403 Blocked by ArgusSecurityPlugin Uifid Not Found   （缺 uifid）
+#   403 Blocked by ArgusSecurityPlugin Signature Not Found（缺签名）
+# 三种取值：
+#   auto    : 先走 f2 接口，探测到系统性 403 时自动降级浏览器解析（默认，推荐）
+#   f2      : 只用 f2 接口（快，但服务端变更签名时整体失败）
+#   browser : 只用浏览器解析（慢但稳；需本机装 Chrome/Edge/Chromium）
+resolve_mode: "browser"
+
+# 浏览器解析时，等待播放器起播取直链的最长秒数（网络慢时可调大）
+browser_wait_seconds: 25.0
+
+# 浏览器 CDP 调试端口，0 = 自动选空闲端口；固定端口便于复用已开着的 Chrome
+browser_port: 0
+
+
+# ── 并发分段下载（v0.6.0，移植自即存 jicun-dl 下载引擎）────────
+# 原实现是单连接顺序流式下载，受抖音 CDN 单连接限速影响速度低，且断连即整段重来。
+# 开启后走：探针(bytes=0-0) → 分段 → 共享游标多路并发 → seek 直接写偏移
+#          → 断点续传 → 慢连接轮换 → 多道完整性校验
+concurrent_download: true
+
+# 每文件并发连接数（对齐 jicun-dl DEFAULT_LANES=32）。
+# 实际并发会被「分段数」自然收敛：4MB 的视频只分 1 段，就只开 1 条连接。
+dl_lanes: 32
+
+# 同时下载几个文件（对齐 jicun-dl FILE_CONCURRENCY=4）。
+# 批量下多个视频时摊薄连接数，避免开 4×32=128 条连接撞 CDN 并发上限。
+dl_file_concurrency: 4
+
+# 主体分段大小（字节，默认 4MB）：一次 Range 拉一段
+dl_segment_bytes: 4194304
+
+# 文件尾部 32MB 内切成 1MB 小段。
+# 实测收尾时慢连接拖住一个 4MB 段要 8.5s，切到 1/4 后拖累按 1/4 计。
+dl_tail_bytes: 33554432
+dl_tail_chunk_bytes: 1048576
+
+# 小于此字节数不分段，走单连接顺序下载（避免小文件开一堆连接反而更慢）
+dl_segment_from_bytes: 8388608
+
+# 慢连接轮换阈值（秒）：一条连接在该时间内没收完当前段就掐掉、从断点换连接。
+# 判据是「用多久没收完」而非速率——同批连接速率差 20 倍是常态，
+# 拿绝对速率当判据不是误杀就是没反应。改动 dl_segment_bytes 时建议同步调整。
+dl_connection_budget: 10.0

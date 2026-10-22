@@ -1,0 +1,27 @@
+# ── Python ──────────────────────────────────────
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# ── uv / 虚拟环境 ───────────────────────────────
+.venv/
+.python-version
+
+# ── 运行产物（下载文件、日志、临时数据库） ────────
+downloads/
+var/
+logs/
+*.db
+.douyindl/
+app.log
+urls_fail
+
+# ── 编辑器 / IDE ────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+urls
