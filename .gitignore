@@ -20,6 +20,8 @@ publisher/.venv/
 publisher/var/
 webui/.venv/
 webui/__pycache__/
+publish_taobao/var/
+publish_taobao/logs/
 .pytest_cache/
 .ruff_cache/
 *.log
