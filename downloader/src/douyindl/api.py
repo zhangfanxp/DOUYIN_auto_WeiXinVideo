@@ -27,7 +27,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
-from douyindl.downloader import Config, DouyinDownloader
+from douyindl.downloader import Config, DouyinDownloader, setup_logger
+from douyindl.logger import logger
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -254,8 +255,14 @@ class JobManager:
                         key=lambda path: (path.suffix.lower() == ".json", path.name.lower()),
                     )
                     has_media = any(path.suffix.lower() in MEDIA_EXTENSIONS for path in job.files)
-                    if not has_media or int(result.get("success", 0)) < 1:
+                    if not has_media:
                         raise RuntimeError("The download finished without producing a media file")
+                    success_count = int(result.get("success", 0))
+                    if success_count < 1:
+                        raise RuntimeError(
+                            "The downloader produced media files but reported no successful downloads "
+                            f"(success={success_count}); see downloader/app.log for the underlying error"
+                        )
 
                     # Avoid returning the server's local filesystem path in the API response.
                     job.result = {
@@ -270,6 +277,7 @@ class JobManager:
                     job.updated_at = _now()
                     raise
                 except Exception as exc:
+                    logger.exception("Download job failed: job_id=%s", job_id)
                     job.status = "failed"
                     job.error = f"{type(exc).__name__}: {exc}"[:500]
                     job.updated_at = _now()
@@ -318,6 +326,7 @@ async def lifespan(app: FastAPI):
         os.getenv("DOUYIN_API_OUTPUT_DIR", str(PROJECT_ROOT / "var" / "downloads"))
     ).expanduser().resolve()
     config = Config(PROJECT_ROOT / "config" / "config.yaml")
+    setup_logger(level=config.log_level, log_file=config.log_file)
     config.resolve_mode = "browser"
     config.enable_progress = False
     config.save_metadata = True

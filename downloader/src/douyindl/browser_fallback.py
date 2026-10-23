@@ -516,6 +516,14 @@ class _DetailSniffer:
         self.aweme: Optional[dict] = None
         self._req_ids: set = set()
         self._tasks: set = set()
+        self.request_seen = False
+        self.http_status: Optional[int] = None
+        self.api_status_code = None
+        self.api_status_msg = ""
+        self.aweme_seen = False
+        self.video_seen = False
+        self.play_addr_seen = False
+        self.body_error = ""
 
     def handle(self, method: str, params: dict) -> None:
         """事件回调（由 _CDPSession 读循环同步调用）。"""
@@ -524,6 +532,14 @@ class _DetailSniffer:
             url = ((params.get("request") or {}).get("url")) or ""
             if "/aweme/v1/web/aweme/detail/" in url:
                 self._req_ids.add(req_id)
+                self.request_seen = True
+        elif method == "Network.responseReceived":
+            if params.get("requestId") in self._req_ids:
+                response = params.get("response") or {}
+                try:
+                    self.http_status = int(response.get("status"))
+                except (TypeError, ValueError):
+                    pass
         elif method == "Network.loadingFinished":
             req_id = params.get("requestId")
             if req_id in self._req_ids:
@@ -535,10 +551,12 @@ class _DetailSniffer:
     async def _grab(self, req_id: str) -> None:
         try:
             res = await self._session.call("Network.getResponseBody", {"requestId": req_id})
-        except Exception:
+        except Exception as exc:
+            self.body_error = type(exc).__name__
             return
         body = res.get("body") or ""
         if not body:
+            self.body_error = "empty_body"
             return
         if res.get("base64Encoded"):
             try:
@@ -548,14 +566,24 @@ class _DetailSniffer:
         try:
             data = json.loads(body)
         except Exception:
+            self.body_error = "invalid_json"
             return
+        if not isinstance(data, dict):
+            self.body_error = "unexpected_json_shape"
+            return
+        self.api_status_code = data.get("status_code")
+        self.api_status_msg = str(data.get("status_msg") or "")[:160]
         detail = data.get("aweme_detail")
         if not isinstance(detail, dict):
             return
         # 页面可能重复发该请求；只接受与目标 id 一致的响应
         if self.aweme_id and str(detail.get("aweme_id")) != str(self.aweme_id):
             return
-        if not ((detail.get("video") or {}).get("play_addr")):
+        self.aweme_seen = True
+        video = detail.get("video") or {}
+        self.video_seen = bool(video)
+        self.play_addr_seen = bool(video.get("play_addr"))
+        if not self.play_addr_seen:
             return
         self.aweme = detail
 
@@ -690,29 +718,52 @@ async def _resolve_one(
             await s.setup(user_agent)
             sniffer = _DetailSniffer(s, aweme_id)
             s.on_event(sniffer.handle)
-            await s.call("Page.navigate", {"url": f"https://www.douyin.com/video/{aweme_id}"})
-
-            deadline = time.monotonic() + wait_seconds
             srcs: List[str] = []
-            while time.monotonic() < deadline:
-                # 拦截到即返回（通常 2~4 秒，不必等播放器起播）
-                if sniffer.aweme:
-                    got = _aweme_to_resolved(sniffer.aweme, aweme_id)
-                    if got.play_url:
-                        logger.debug(
-                            f"拦截 aweme/detail 成功: {aweme_id} "
-                            f"desc={len(got.desc)}字"
-                        )
-                        return got
-                await asyncio.sleep(0.4)
-                # 兜底轮询：<video> 元素
-                if not srcs:
-                    try:
-                        got = await s.eval(_JS_GET_VIDEO_SRC)
-                        if got:
-                            srcs = list(got)
-                    except Exception:
-                        pass
+
+            async def wait_for_result(seconds: float) -> Optional[BrowserResolved]:
+                deadline = time.monotonic() + seconds
+                while time.monotonic() < deadline:
+                    # 拦截到即返回（通常 2~4 秒，不必等播放器起播）
+                    if sniffer.aweme:
+                        resolved = _aweme_to_resolved(sniffer.aweme, aweme_id)
+                        if resolved.play_url:
+                            logger.debug(
+                                f"拦截 aweme/detail 成功: {aweme_id} "
+                                f"desc={len(resolved.desc)}字"
+                            )
+                            return resolved
+                    await asyncio.sleep(0.4)
+                    # 兜底轮询：<video> 元素
+                    if not srcs:
+                        try:
+                            found = await s.eval(_JS_GET_VIDEO_SRC)
+                            if found:
+                                srcs.extend(found)
+                        except Exception:
+                            pass
+                return None
+
+            video_url = f"https://www.douyin.com/video/{aweme_id}"
+            await s.call("Page.navigate", {"url": video_url})
+            resolved = await wait_for_result(wait_seconds)
+            if resolved:
+                return resolved
+
+            # 空白页可能是抖音偶发的加载/风控响应，先在同一会话里刷新重试一次。
+            try:
+                title = await s.eval(_JS_GET_TITLE) or ""
+            except Exception:
+                title = ""
+            if not title and not sniffer.aweme and wait_seconds > 0:
+                logger.warning(f"视频页未渲染出标题，刷新重试一次: {aweme_id}")
+                try:
+                    await s.call("Page.reload", {"ignoreCache": True})
+                    retry_wait = min(max(wait_seconds * 0.5, 4.0), 12.0)
+                    resolved = await wait_for_result(retry_wait)
+                    if resolved:
+                        return resolved
+                except Exception as exc:
+                    logger.debug(f"刷新视频页失败（继续使用已有结果）: {exc}")
 
             if not _pick_best_src(srcs, aweme_id):
                 # 兜底：查 <source> 与性能记录（player 用 blob: 时会命中）
@@ -724,9 +775,9 @@ async def _resolve_one(
                     pass
 
             try:
-                title = await s.eval(_JS_GET_TITLE) or ""
+                title = await s.eval(_JS_GET_TITLE) or title
             except Exception:
-                title = ""
+                pass
             meta = {}
             try:
                 meta = await s.eval(_JS_GET_DESC) or {}
@@ -735,10 +786,23 @@ async def _resolve_one(
 
         best = _pick_best_src(srcs, aweme_id)
         if not best:
+            diagnostics = [
+                f"详情请求={'已观察到' if sniffer.request_seen else '未观察到'}",
+                f"HTTP={sniffer.http_status if sniffer.http_status is not None else '未知'}",
+                f"API status_code={sniffer.api_status_code if sniffer.api_status_code is not None else '未知'}",
+                f"作品详情={'有' if sniffer.aweme_seen else '无'}",
+                f"视频数据={'有' if sniffer.video_seen else '无'}",
+                f"play_addr={'有' if sniffer.play_addr_seen else '无'}",
+            ]
+            if sniffer.api_status_msg:
+                diagnostics.append(f"API提示={sniffer.api_status_msg}")
+            if sniffer.body_error:
+                diagnostics.append(f"响应体={sniffer.body_error}")
+            diag_text = "，".join(diagnostics)
             raise BrowserResolveError(
-                f"页面已加载但未取到视频直链（aweme_id={aweme_id}）。"
-                f"已拦截 aweme/detail 但未获得可用 play_addr，"
-                f"可能触发了验证码或视频已删除，页面标题：{title!r}"
+                f"未能从抖音页面取得视频直链（aweme_id={aweme_id}）。"
+                f"诊断：{diag_text}；页面标题：{title!r}。"
+                f"若作品仍可公开播放，可稍后重试；也可能受页面风控、权限或作品状态影响。"
             )
         logger.debug(f"aweme/detail 拦截失败，回退 <video> 取直链: {aweme_id}")
         return BrowserResolved(

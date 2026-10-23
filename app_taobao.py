@@ -24,6 +24,32 @@ MAX_TAOBAO_TITLE_LENGTH = 29
 DOUYIN_EPISODE_MARKER = re.compile(
     r"第\s*[0-9零〇一二两兩三四五六七八九十百千万億亿几]+\s*(?:集|期|话|回|章|节|季)"
 )
+SUCCESS_MODAL_CSS = """
+#taobao-success-modal {
+    position: fixed !important;
+    inset: 0 !important;
+    z-index: 10000 !important;
+    width: 100vw !important;
+    height: 100vh !important;
+    background: rgba(15, 23, 42, 0.62) !important;
+    backdrop-filter: blur(2px);
+    align-items: center !important;
+    justify-content: center !important;
+    padding: 1rem !important;
+    box-sizing: border-box !important;
+}
+#taobao-success-card {
+    width: min(34rem, calc(100vw - 2rem)) !important;
+    padding: 2rem !important;
+    border-radius: 1rem !important;
+    background: var(--background-fill-primary) !important;
+    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.32) !important;
+}
+"""
+
+
+def _publish_controls(interactive: bool) -> tuple[Any, ...]:
+    return tuple(gr.update(interactive=interactive) for _ in range(5))
 
 
 def _clean_douyin_title(value: str | None) -> str:
@@ -37,6 +63,25 @@ def _clean_douyin_title(value: str | None) -> str:
         or unicodedata.category(char) == "Zs"
     )
     return " ".join(plain.split())[:MAX_TAOBAO_TITLE_LENGTH]
+
+
+def _taobao_status_label(metadata: dict[str, Any]) -> str:
+    status = str(metadata.get("taobao_video_publish_status") or "not_submitted")
+    if metadata.get("taobao_video_published") or status == "published":
+        return "已发布"
+    return {
+        "submitted": "已提交，待审核",
+        "submit_clicked_unverified": "已提交，待核实",
+        "not_submitted": "尚未发布",
+    }.get(status, "尚未发布")
+
+
+def _with_taobao_status(message: str, metadata: dict[str, Any]) -> str:
+    status_line = f"淘宝商家商品状态：{_taobao_status_label(metadata)}"
+    updated, count = re.subn(r"(?m)^视频号状态：.*$", status_line, message)
+    if count:
+        return updated
+    return f"{message.rstrip()}\n{status_line}" if message else status_line
 
 
 def _headers() -> dict[str, str]:
@@ -107,6 +152,7 @@ def download_taobao_video(url: str, progress=gr.Progress()) -> tuple[Any, ...]:
     metadata = download_app._load_metadata(metadata_path)
     metadata.setdefault("taobao_video_published", False)
     metadata.setdefault("taobao_video_publish_status", "not_submitted")
+    result[0] = _with_taobao_status(str(result[0] or ""), metadata)
     douyin_title = str(
         metadata.get("original_title") or metadata.get("original_description") or ""
     )
@@ -133,7 +179,7 @@ def submit_taobao_video(
     title: str,
     description: str,
     progress=gr.Progress(),
-) -> tuple[str, dict[str, Any]]:
+) -> tuple[Any, ...]:
     try:
         video_path, metadata_path, metadata = _current_video(state)
     except gr.Error:
@@ -150,6 +196,8 @@ def submit_taobao_video(
         "submit_clicked_unverified",
     }:
         raise gr.Error("此视频已有一次淘宝发布提交记录。请先到商家后台核对，再决定是否重试。")
+    if mode == "publish" and (state or {}).get("taobao_publish_job"):
+        raise gr.Error("此视频的淘宝发布任务仍在处理中，请等待当前任务完成。")
 
     payload = {
         "video": video_path.name,
@@ -179,6 +227,23 @@ def submit_taobao_video(
             if not job_id:
                 raise RuntimeError("淘宝发布服务没有返回 job_id")
 
+            if mode == "publish":
+                pending_job = {
+                    "job_id": job_id,
+                    "video_name": video_path.name,
+                    "metadata_path": str(metadata_path),
+                    "title": title.strip(),
+                    "description": description.strip(),
+                    "started_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                }
+                state = {**(state or {}), "taobao_publish_job": pending_job}
+                return (
+                    "⏳ 淘宝发布任务已启动，页面会自动等待结果。",
+                    state,
+                    gr.update(active=True),
+                    *_publish_controls(False),
+                )
+
             deadline = time.monotonic() + PUBLISH_TIMEOUT_SECONDS
             logged_steps = 0
             while job.get("status") not in {"succeeded", "failed"}:
@@ -206,24 +271,12 @@ def submit_taobao_video(
         if mode == "prepare":
             if platform_state != "form_prepared":
                 raise RuntimeError(f"淘宝服务返回了未预期的表单状态：{platform_state!r}")
-            return "✅ 视频已上传，创作者声明已选择“个人观点，仅供参考”，并已添加商品列表中的第一个商品；表单已保留，尚未提交。", state or {}
-        if platform_state not in {"submitted", "submit_clicked_unverified"}:
-            raise RuntimeError(f"淘宝服务返回了未预期的发布状态：{platform_state!r}")
-
-        metadata = download_app._load_metadata(metadata_path)
-        metadata["taobao_video_published"] = False
-        metadata["taobao_video_publish_status"] = platform_state
-        metadata["taobao_video_submit_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
-        metadata["taobao_video_submit_job_id"] = job_id
-        metadata["taobao_video_submit_title"] = title.strip()
-        metadata["taobao_video_submit_description"] = description.strip()
-        download_app._write_metadata(metadata_path, metadata)
-        state = {**(state or {}), "metadata": metadata}
-
-        note = result.get("note") or "淘宝发布操作已提交。"
-        if platform_state == "submitted":
-            return f"✅ 淘宝页面已确认接收提交。{note}\n审核结果请在淘宝商家后台查看。", state
-        return f"淘宝页面未确认提交结果，请检查保留的浏览器页后再决定是否重试。\n{note}", state
+            return (
+                "✅ 视频已上传，创作者声明已选择“个人观点，仅供参考”，并已添加商品列表中的第一个商品；表单已保留，尚未提交。",
+                state or {},
+                gr.update(active=False),
+                *_publish_controls(True),
+            )
     except gr.Error:
         raise
     except Exception as exc:
@@ -231,10 +284,121 @@ def submit_taobao_video(
         raise gr.Error(f"淘宝发布失败：{exc}") from exc
 
 
+def poll_taobao_publish(
+    state: dict[str, Any] | None,
+    download_status: str,
+) -> tuple[Any, ...]:
+    """Poll the short-lived API endpoint separately from the long browser task."""
+    pending_job = (state or {}).get("taobao_publish_job")
+    if not isinstance(pending_job, dict) or not pending_job.get("job_id"):
+        return (
+            gr.skip(), gr.skip(), gr.skip(), gr.update(active=False), gr.update(visible=False),
+            *_publish_controls(True),
+        )
+
+    job_id = str(pending_job["job_id"])
+    try:
+        with httpx.Client(timeout=httpx.Timeout(connect=8, read=15, write=15, pool=8)) as client:
+            job = _response_json(
+                client.get(
+                    f"{TAOBAO_API_BASE_URL}/api/v1/publish/{job_id}",
+                    headers=_headers(),
+                )
+            )
+    except Exception as exc:
+        logger.warning("暂时无法读取淘宝发布任务状态：job_id=%s error=%s", job_id, exc)
+        return (
+            f"⏳ 暂时无法连接淘宝发布服务，页面正在自动重试。任务编号：{job_id[:8]}",
+            gr.skip(),
+            state or {},
+            gr.update(active=True),
+            gr.skip(),
+            *_publish_controls(False),
+        )
+
+    if job.get("status") in {"queued", "running"}:
+        step = job.get("step") or "淘宝正在处理视频"
+        return (
+            f"⏳ {step}。页面会自动更新结果。",
+            gr.skip(),
+            state or {},
+            gr.update(active=True),
+            gr.skip(),
+            *_publish_controls(False),
+        )
+
+    updated_state = dict(state or {})
+    updated_state.pop("taobao_publish_job", None)
+    if job.get("status") != "succeeded":
+        return (
+            f"❌ 淘宝发布失败：{job.get('error') or '未知错误'}",
+            gr.skip(),
+            updated_state,
+            gr.update(active=False),
+            gr.update(visible=False),
+            *_publish_controls(True),
+        )
+
+    result = job.get("result") or {}
+    platform_state = result.get("platform_state")
+    if platform_state not in {"submitted", "submit_clicked_unverified"}:
+        return (
+            f"❌ 淘宝服务返回了未预期的发布状态：{platform_state!r}",
+            gr.skip(),
+            updated_state,
+            gr.update(active=False),
+            gr.update(visible=False),
+            *_publish_controls(True),
+        )
+
+    metadata_path = Path(str(pending_job.get("metadata_path", ""))).resolve()
+    videos_dir = Path(download_app.VIDEOS_DIR).resolve()
+    if not metadata_path.is_relative_to(videos_dir) or not metadata_path.is_file():
+        return (
+            "❌ 发布结果已返回，但找不到对应的视频 JSON 文件。请检查 Videos 文件夹。",
+            gr.skip(),
+            updated_state,
+            gr.update(active=False),
+            gr.update(visible=False),
+            *_publish_controls(True),
+        )
+
+    metadata = download_app._load_metadata(metadata_path)
+    metadata["taobao_video_published"] = False
+    metadata["taobao_video_publish_status"] = platform_state
+    metadata["taobao_video_submit_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    metadata["taobao_video_submit_job_id"] = job_id
+    metadata["taobao_video_submit_title"] = str(pending_job.get("title", ""))
+    metadata["taobao_video_submit_description"] = str(pending_job.get("description", ""))
+    download_app._write_metadata(metadata_path, metadata)
+    updated_state["metadata"] = metadata
+    download_status = _with_taobao_status(download_status, metadata)
+
+    note = result.get("note") or "淘宝发布操作已提交。"
+    if platform_state == "submitted":
+        return (
+            f"✅ 淘宝商家后台已确认接收提交。{note}\n审核结果请在淘宝商家后台查看。",
+            download_status,
+            updated_state,
+            gr.update(active=False),
+            gr.update(visible=True),
+            *_publish_controls(True),
+        )
+    return (
+        f"淘宝页面未确认提交结果，请检查保留的浏览器页后再决定是否重试。\n{note}",
+        download_status,
+        updated_state,
+        gr.update(active=False),
+        gr.update(visible=False),
+        *_publish_controls(True),
+    )
+
+
 def mark_taobao_video_published(
     state: dict[str, Any] | None,
     confirmed: bool,
-) -> tuple[str, dict[str, Any], bool]:
+    download_status: str,
+) -> tuple[str, str, dict[str, Any], bool]:
     if not confirmed:
         raise gr.Error("请先确认你已在淘宝商家后台看到该视频发布成功。")
     _, metadata_path, metadata = _current_video(state)
@@ -243,7 +407,12 @@ def mark_taobao_video_published(
     metadata["taobao_video_published_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
     download_app._write_metadata(metadata_path, metadata)
     state = {**(state or {}), "metadata": metadata}
-    return f"已更新 {metadata_path.name}：taobao_video_published = true", state, False
+    return (
+        f"已更新 {metadata_path.name}：taobao_video_published = true",
+        _with_taobao_status(download_status, metadata),
+        state,
+        False,
+    )
 
 
 def _publish_after_download(
@@ -252,11 +421,39 @@ def _publish_after_download(
     title: str,
     description: str,
     progress=gr.Progress(),
-) -> tuple[str, Any]:
+) -> tuple[Any, ...]:
     status_text = (download_status or "").strip()
     if not status_text.startswith(("下载完成：", "已从 Videos 恢复")):
-        return "下载未成功，已取消淘宝发布。请先检查下载状态。", gr.skip()
+        return (
+            "下载未成功，已取消淘宝发布。请先检查下载状态。",
+            gr.skip(),
+            gr.update(active=False),
+            *_publish_controls(True),
+        )
     return submit_taobao_video("publish", state, title, description, progress=progress)
+
+
+def acknowledge_taobao_publish() -> tuple[Any, ...]:
+    """Close the success dialog and clear the form for the next video."""
+    return (
+        "",  # Douyin URL
+        "",  # Download status
+        None,  # Preview
+        "",  # Original title
+        "",  # Original publish date
+        "",  # Description
+        "",  # Taobao title
+        "无需标注",  # Hidden legacy annotation
+        "",  # Hidden legacy topics
+        [],  # Downloaded files
+        None,  # Current video state
+        "",  # Publish status
+        "",  # JSON tracking status
+        False,  # Manual confirmation checkbox
+        gr.update(visible=False),  # Success dialog
+        gr.update(active=False),  # Publish timer
+        *_publish_controls(True)[:4],
+    )
 
 
 def build_app() -> gr.Blocks:
@@ -310,6 +507,15 @@ def build_app() -> gr.Blocks:
                 prepare_button = gr.Button("准备淘宝发布表单（不提交）", variant="secondary")
                 publish_button = gr.Button("确认并发布到淘宝", variant="stop")
         publish_status = gr.Textbox(label="淘宝发布状态", interactive=False, lines=4)
+        publish_timer = gr.Timer(value=2, active=False)
+
+        with gr.Group(visible=False, elem_id="taobao-success-modal") as success_modal:
+            with gr.Column(elem_id="taobao-success-card"):
+                gr.Markdown(
+                    "## ✅ 淘宝发布成功\n"
+                    "淘宝商家后台已成功接收本次发布。审核或公开状态请在淘宝商家后台查看。"
+                )
+                acknowledge_button = gr.Button("我知道了", variant="primary")
 
         with gr.Row():
             confirmed_published = gr.Checkbox(
@@ -349,7 +555,16 @@ def build_app() -> gr.Blocks:
         ).then(
             fn=_publish_after_download,
             inputs=[download_status, current_state, title, description],
-            outputs=[publish_status, current_state],
+            outputs=[
+                publish_status,
+                current_state,
+                publish_timer,
+                douyin_url,
+                download_button,
+                download_and_publish_button,
+                prepare_button,
+                publish_button,
+            ],
             concurrency_limit=1,
             concurrency_id="taobao_publish",
             show_progress="full",
@@ -357,7 +572,16 @@ def build_app() -> gr.Blocks:
         prepare_button.click(
             fn=submit_taobao_video,
             inputs=[prepare_mode, current_state, title, description],
-            outputs=[publish_status, current_state],
+            outputs=[
+                publish_status,
+                current_state,
+                publish_timer,
+                douyin_url,
+                download_button,
+                download_and_publish_button,
+                prepare_button,
+                publish_button,
+            ],
             concurrency_limit=1,
             concurrency_id="taobao_publish",
             show_progress="full",
@@ -365,15 +589,70 @@ def build_app() -> gr.Blocks:
         publish_button.click(
             fn=submit_taobao_video,
             inputs=[publish_mode, current_state, title, description],
-            outputs=[publish_status, current_state],
+            outputs=[
+                publish_status,
+                current_state,
+                publish_timer,
+                douyin_url,
+                download_button,
+                download_and_publish_button,
+                prepare_button,
+                publish_button,
+            ],
             concurrency_limit=1,
             concurrency_id="taobao_publish",
             show_progress="full",
         )
+        publish_timer.tick(
+            fn=poll_taobao_publish,
+            inputs=[current_state, download_status],
+            outputs=[
+                publish_status,
+                download_status,
+                current_state,
+                publish_timer,
+                success_modal,
+                douyin_url,
+                download_button,
+                download_and_publish_button,
+                prepare_button,
+                publish_button,
+            ],
+            concurrency_limit=1,
+            concurrency_id="taobao_publish_poll",
+            trigger_mode="always_last",
+            show_progress="hidden",
+        )
+        acknowledge_button.click(
+            fn=acknowledge_taobao_publish,
+            outputs=[
+                douyin_url,
+                download_status,
+                preview,
+                original_title,
+                original_publish_date,
+                description,
+                title,
+                annotation,
+                topics,
+                downloaded_files,
+                current_state,
+                publish_status,
+                tracking_status,
+                confirmed_published,
+                success_modal,
+                publish_timer,
+                download_button,
+                download_and_publish_button,
+                prepare_button,
+                publish_button,
+            ],
+            show_progress="hidden",
+        )
         mark_published_button.click(
             fn=mark_taobao_video_published,
-            inputs=[current_state, confirmed_published],
-            outputs=[tracking_status, current_state, confirmed_published],
+            inputs=[current_state, confirmed_published, download_status],
+            outputs=[tracking_status, download_status, current_state, confirmed_published],
             concurrency_limit=1,
         )
     return demo
@@ -390,6 +669,7 @@ if __name__ == "__main__":
         server_name=os.getenv("WEBUI_HOST", "127.0.0.1"),
         server_port=int(os.getenv("TAOBAO_WEBUI_PORT", "7861")),
         allowed_paths=[str(download_app.VIDEOS_DIR)],
+        css=SUCCESS_MODAL_CSS,
         theme=gr.themes.Soft(),
         inbrowser=True,
         share=False,

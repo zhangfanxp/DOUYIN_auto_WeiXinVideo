@@ -123,6 +123,9 @@ class TaobaoBrowser:
                     args=["--start-maximized"],
                 )
             self.home_page = self.context.pages[0] if self.context.pages else await self.context.new_page()
+            existing_pages = [page for page in self.context.pages if page is not self.home_page]
+            latest_existing_page = existing_pages[-1] if existing_pages else None
+            await self._close_extra_browser_pages(keep_page=latest_existing_page)
             self.status = "waiting_for_login"
             await self.home_page.goto(TAOBAO_HOME_URL, wait_until="domcontentloaded", timeout=60_000)
             try:
@@ -202,6 +205,9 @@ class TaobaoBrowser:
         self.last_submit_button_info = None
         prepared_form = self._get_prepared_form(video_path) if mode == "publish" else None
         reusing_prepared_form = prepared_form is not None
+        await self._close_extra_browser_pages(
+            keep_page=prepared_form[0] if prepared_form is not None else None
+        )
         if prepared_form is None:
             page = await self.context.new_page()
             scope = page
@@ -391,12 +397,13 @@ class TaobaoBrowser:
         except Exception as exc:
             report(f"执行失败：{type(exc).__name__}: {exc}")
             if not page.is_closed():
-                keep_page_open = True
-                self._retain_page(page)
                 try:
                     await self._save_page_diagnostics(page, scope)
-                    await page.bring_to_front()
-                    report("错误页面诊断已保存，浏览器页面已保留供检查")
+                    if keep_page_open:
+                        await page.bring_to_front()
+                        report("诊断已保存；此页面需要保留以完成淘宝登录或人工核对")
+                    else:
+                        report("错误页面诊断已保存，本次发布页将自动关闭")
                 except Exception as diagnostic_error:
                     logger.warning("保存淘宝页面诊断失败：%s", diagnostic_error)
             logger.exception("淘宝页面自动化失败")
@@ -840,10 +847,17 @@ class TaobaoBrowser:
             await self._save_page_diagnostics(page, scope)
             raise RuntimeError("点击“添加商品”后未找到淘宝商品选择面板；页面诊断已保存")
 
+        report("关联商品弹窗已打开，正在等待淘宝加载店铺商品列表")
+        await self._wait_for_product_picker_data(picker, page, report)
+        report("店铺商品列表已加载，正在选择第一个商品")
         selected_label = await self._select_first_product_in_picker(picker, scope)
         if selected_label is None:
             await self._save_page_diagnostics(page, scope)
-            raise RuntimeError("淘宝商品选择面板中没有找到可选择的商品；页面诊断已保存")
+            picker_text = re.sub(r"\s+", " ", await picker.inner_text(timeout=2_000)).strip()
+            raise RuntimeError(
+                "淘宝商品列表已结束加载，但没有找到可选择的商品；"
+                f"弹窗内容：{picker_text[:240]}；页面诊断已保存"
+            )
 
         report(f"已选择第一个商品：{selected_label[:80]}；正在确认添加")
         confirm_labels = ("确定添加", "添加商品", "确认选择", "确定", "确认", "完成", "选好了")
@@ -887,6 +901,48 @@ class TaobaoBrowser:
             except Exception:
                 pass
 
+    async def _wait_for_product_picker_data(
+        self,
+        picker,
+        page: Page,
+        report: Callable[[str], None],
+        timeout: float = 90,
+    ) -> None:
+        """Wait for Taobao's async product query to finish before searching its rows."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        next_progress = asyncio.get_running_loop().time() + 10
+        started = asyncio.get_running_loop().time()
+        stable_since: float | None = None
+        loading_markers = (
+            "数据加载中",
+            "加载中，请耐心等待",
+            "正在加载商品",
+        )
+        while asyncio.get_running_loop().time() < deadline:
+            now = asyncio.get_running_loop().time()
+            try:
+                text = re.sub(r"\s+", "", await picker.inner_text(timeout=2_000))
+            except Exception:
+                text = ""
+            if any(marker in text for marker in loading_markers):
+                stable_since = None
+            elif stable_since is None:
+                stable_since = now
+            elif now - started >= 3 and now - stable_since >= 1.5:
+                # Require a short stable, non-loading window so we don't race
+                # the request that starts just after the dialog is mounted.
+                return
+
+            if now >= next_progress:
+                report(f"淘宝商品列表仍在加载，已等待 {int(now - started)} 秒")
+                next_progress = now + 10
+            await asyncio.sleep(0.5)
+
+        await self._save_page_diagnostics(page, picker)
+        raise RuntimeError(
+            f"淘宝关联商品列表持续显示加载中，等待 {int(timeout)} 秒仍未完成；页面诊断已保存"
+        )
+
     async def _select_first_product_in_picker(self, picker, fallback_scope=None) -> str | None:
         row_selectors = (
             "tbody tr",
@@ -919,12 +975,36 @@ class TaobaoBrowser:
                 pass
             try:
                 class_name = await control.get_attribute("class") or ""
-                return bool(re.search(r"(?:^|[-_ ])(?:checked|selected)(?:$|[-_ ])", class_name))
+                if re.search(r"(?:^|[-_ ])(?:checked|selected)(?:$|[-_ ])", class_name):
+                    return True
             except Exception:
-                return False
+                pass
+            # Next's styled checkbox can reflect selection on its wrapper while
+            # the hidden native input updates a moment later.
+            for level in range(1, 4):
+                try:
+                    ancestor = control.locator(f"xpath={'/'.join(['..'] * level)}").first
+                    if await ancestor.get_attribute("aria-checked") == "true":
+                        return True
+                    if await ancestor.get_attribute("aria-selected") == "true":
+                        return True
+                    class_name = await ancestor.get_attribute("class") or ""
+                    if re.search(r"(?:^|[-_ ])(?:checked|selected)(?:$|[-_ ])", class_name):
+                        return True
+                except Exception:
+                    continue
+            return False
+
+        async def wait_until_selected(control, timeout: float = 1.5) -> bool:
+            deadline = asyncio.get_running_loop().time() + timeout
+            while asyncio.get_running_loop().time() < deadline:
+                if await is_selected(control):
+                    return True
+                await asyncio.sleep(0.05)
+            return await is_selected(control)
 
         async def activate(control, context=None) -> bool:
-            """Handle native inputs and Taobao's visually styled checkbox wrappers."""
+            """Click Taobao's visible checkbox wrapper and verify its live state."""
             if await is_selected(control):
                 return True
 
@@ -934,6 +1014,19 @@ class TaobaoBrowser:
                 )
             except Exception:
                 native = False
+
+            # Taobao renders a visually styled label around a hidden native
+            # checkbox. Clicking the label first follows the same path as a
+            # user click and avoids clicking the hidden input's zero-size box.
+            try:
+                label = control.locator("xpath=ancestor::label[1]").first
+                if await label.count() and await label.is_visible():
+                    await label.scroll_into_view_if_needed(timeout=2_000)
+                    await label.click(timeout=2_000, force=True)
+                    if await wait_until_selected(control):
+                        return True
+            except Exception:
+                pass
 
             if native:
                 try:
@@ -945,16 +1038,14 @@ class TaobaoBrowser:
                         await control.evaluate("node => node.click()")
                     except Exception:
                         pass
-                await asyncio.sleep(0.1)
-                if await is_selected(control):
+                if await wait_until_selected(control):
                     return True
             else:
                 try:
                     await control.click(timeout=2_000, force=True)
                 except Exception:
                     pass
-                await asyncio.sleep(0.1)
-                if await is_selected(control):
+                if await wait_until_selected(control):
                     return True
 
             # Some versions hide the native input and handle clicks on a label
@@ -983,12 +1074,24 @@ class TaobaoBrowser:
                 try:
                     if not await candidate.is_visible():
                         continue
+                    await candidate.scroll_into_view_if_needed(timeout=2_000)
                     await candidate.click(timeout=2_000, force=True)
                 except Exception:
                     continue
-                await asyncio.sleep(0.1)
-                if await is_selected(control):
+                if await wait_until_selected(control):
                     return True
+
+            # The visual checkbox itself is the most reliable hit target in
+            # product cards where the surrounding image/text has no click handler.
+            for selector in (".next-checkbox-inner", ".next-checkbox"):
+                try:
+                    visual_control = control.locator("xpath=..").locator(selector).first
+                    if await visual_control.count() and await visual_control.is_visible():
+                        await visual_control.click(timeout=2_000, force=True)
+                        if await wait_until_selected(control):
+                            return True
+                except Exception:
+                    continue
 
             # Last resort: click the product card containing the control.
             if context is not None:
@@ -996,8 +1099,7 @@ class TaobaoBrowser:
                     await context.click(timeout=2_000, force=True)
                 except Exception:
                     pass
-                await asyncio.sleep(0.1)
-                if await is_selected(control):
+                if await wait_until_selected(control):
                     return True
             return False
 
@@ -1243,7 +1345,9 @@ class TaobaoBrowser:
                     "nodes => nodes.slice(0, 60).map(node => ({tag:node.tagName,type:node.type,"
                     "name:node.name,placeholder:node.placeholder,aria:node.getAttribute('aria-label'),"
                     "className:typeof node.className==='string'?node.className:'',"
-                    "checked:!!node.checked,ariaChecked:node.getAttribute('aria-checked'),"
+                    "checked:!!node.checked,disabled:!!node.disabled,"
+                    "ariaChecked:node.getAttribute('aria-checked'),"
+                    "outerHTML:node.outerHTML.slice(0,500),"
                     "parentText:(node.closest('label')?.innerText||node.parentElement?.innerText||'').slice(0,120),"
                     "ancestors:(()=>{let e=node,out=[];for(let i=0;e&&i<4;i++,e=e.parentElement)"
                     "out.push({tag:e.tagName,className:typeof e.className==='string'?e.className:'',"
@@ -1285,6 +1389,39 @@ class TaobaoBrowser:
         if page not in self.prepared_pages:
             self.prepared_pages.append(page)
 
+    async def _close_extra_browser_pages(self, keep_page: Page | None = None) -> None:
+        """Keep the login tab and at most the current retained publishing tab open."""
+        if self.context is None:
+            return
+
+        retained: list[Page] = []
+        closed_ids: set[int] = set()
+        for page in list(self.context.pages):
+            if page.is_closed():
+                continue
+            if page is self.home_page or page is keep_page:
+                if page in self.prepared_pages and page is not self.home_page:
+                    retained.append(page)
+                continue
+            try:
+                await page.close()
+                closed_ids.add(id(page))
+                logger.info("已关闭多余的淘宝发布页签：%s", page.url)
+            except Exception:
+                logger.exception("关闭多余的淘宝发布页签失败：%s", page.url)
+                if page in self.prepared_pages:
+                    retained.append(page)
+
+        self.prepared_pages = retained
+        self.prepared_forms = {
+            key: prepared
+            for key, prepared in self.prepared_forms.items()
+            if not prepared[0].is_closed()
+            and (prepared[0] is keep_page or prepared[0] is self.home_page)
+        }
+        for page_id in closed_ids:
+            self.product_attached_page_ids.discard(page_id)
+
     def _get_prepared_form(self, video_path: Path) -> tuple[Page, Any] | None:
         key = str(video_path.resolve())
         prepared = self.prepared_forms.get(key)
@@ -1294,12 +1431,28 @@ class TaobaoBrowser:
         return prepared
 
     async def close(self) -> None:
-        if self.login_task and not self.login_task.done():
-            self.login_task.cancel()
-            await asyncio.gather(self.login_task, return_exceptions=True)
-        if self.context is not None:
-            await self.context.close()
-            self.context = None
-        if self.playwright is not None:
-            await self.playwright.stop()
-            self.playwright = None
+        login_task, self.login_task = self.login_task, None
+        if login_task is not None and not login_task.done():
+            login_task.cancel()
+            await asyncio.gather(login_task, return_exceptions=True)
+
+        context, self.context = self.context, None
+        if context is not None:
+            try:
+                await context.close()
+            except Exception as exc:
+                # Chromium may already have exited (for example, if its window
+                # was closed manually). Shutdown should still release Playwright.
+                logger.debug("淘宝浏览器上下文已关闭，跳过重复关闭：%s", exc)
+
+        playwright, self.playwright = self.playwright, None
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception as exc:
+                logger.debug("Playwright 已停止，跳过重复停止：%s", exc)
+
+        self.home_page = None
+        self.prepared_pages.clear()
+        self.prepared_forms.clear()
+        self.product_attached_page_ids.clear()
